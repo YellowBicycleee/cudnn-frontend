@@ -1070,7 +1070,9 @@ class BlockSparseAttnBackwardSm90Blk64:
             block=[self.num_threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=True,
+            # Must track the same switch as the preprocess launch and both
+            # griddepcontrol calls; see the wait in load().
+            use_pdl=self.use_pdl,
         )
 
     # ---- Mainloop kernel ----
@@ -1328,8 +1330,11 @@ class BlockSparseAttnBackwardSm90Blk64:
                     pipeline_Q.producer_acquire(producer_state_Q, extra_tx_count=self.tma_copy_bytes["K"])
                     load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
                     load_Q(first_m_block, producer_state=producer_state_Q)
-                    # Wait for bwd preprocess to finish writing LSE and dPsum
-                    cute.arch.griddepcontrol_wait()
+                    # Wait for bwd preprocess to finish writing LSE and dPsum.
+                    # Guarded so PDL can actually be turned off for A/B diagnosis:
+                    # an unconditional wait in a non-PDL launch has no paired trigger.
+                    if const_expr(self.use_pdl):
+                        cute.arch.griddepcontrol_wait()
                     load_LSE(first_m_block, producer_state=producer_state_Q)
                     producer_state_dO_cur = producer_state_dO if const_expr(self.Q_stage != self.dO_stage) else producer_state_Q
                     pipeline_dO.producer_acquire(producer_state_dO_cur, extra_tx_count=self.tma_copy_bytes["V"])

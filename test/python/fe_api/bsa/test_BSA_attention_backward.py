@@ -103,6 +103,61 @@ def test_bsa_attention_backward_fixed_blocks():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=11)
+def test_bsa_attention_backward_sm90_repeated_pipeline_reuse():
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        pytest.skip("repeated SM90 pipeline reuse test requires Hopper")
+
+    BSA = _import_bsa()
+    block_size = 64
+    num_q_blocks = 12
+    batch, heads, seqlen_k, dim = 1, 1, 8 * block_size, 128
+    seqlen_q = num_q_blocks * block_size
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    do = torch.randn_like(q)
+
+    # A shared pair of KV blocks gives each active K-to-Q row 12 entries,
+    # repeatedly reusing the three-stage Q/dO producer pipeline.
+    selected = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    q2k = selected.view(1, 1, 1, 2).expand(batch, heads, num_q_blocks, 2).contiguous()
+    block_sparse_num = 2
+    full_block_sizes = torch.full((seqlen_k // block_size,), block_size, dtype=torch.int32, device="cuda")
+    mask = block_sparse_mask(q2k, block_sparse_num, full_block_sizes, seqlen_q, seqlen_k, block_size)
+    _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
+
+    forward = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num,
+        None,
+        sparse_block_size=block_size,
+    )
+    backward = BSA.block_sparse_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        forward["o_tensor"],
+        forward["lse_tensor"],
+        q2k,
+        block_sparse_num,
+        None,
+        bucket_size_blocks=num_q_blocks,
+        sparse_block_size=block_size,
+    )
+    torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(backward["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(backward["dv_tensor"].float(), dv_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=5)
 def test_bsa_attention_backward_sm100_blk64():
     if not torch.cuda.is_available():
