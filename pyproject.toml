@@ -159,3 +159,6 @@ include = ["**/*"]
 "cudnn._cake" = ["UPSTREAM.md", "jax_ffi.cc"]
 
 "cudnn.causal_conv1d_cake" = ["*.cu"]
+
+# QuACK's license and the vendoring record, shipped with the vendored QuACK modules
+"cudnn.moe_dispatch_mlp_combine.cutedsl._quack" = ["LICENSE", "VENDOR.md"]

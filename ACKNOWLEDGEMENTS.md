@@ -40,3 +40,14 @@ modules in `python/cudnn/`:
 
 Thank you also to the broader CUTLASS/CuTe DSL and infrastructure teams who
 supported the original kernel development.
+
+## MoE dispatch, MLP and combine
+
+The CuTe DSL MoE dispatch, expert MLP and combine megakernels in
+`python/cudnn/moe_dispatch_mlp_combine/` are derived from
+[Mixture-of-Kittens](https://github.com/cursor/mixture-of-kittens) by Cursor Research
+(see `THIRD_PARTY_LICENSES.txt`). We gratefully acknowledge the contributors who
+ported, optimized and tested them:
+
+- Jiancheng Wang <jianchengw@nvidia.com>
+- Qi Zhang <qizhang@nvidia.com>
