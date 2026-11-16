@@ -1210,7 +1210,7 @@ def forward_bf16(
     the symmetric ``workspace.x_buffer`` serves both chains (shared hidden == routed hidden).
 
     ``routed_storage_tables`` are the Gate, Up and Down per-expert base addresses when the routed
-    experts are independent allocations (``cutemok.ops.make_routed_weight_storage_table_bf16`` builds
+    experts are independent allocations (``cudnn.moe_dispatch_mlp_combine.ops.make_routed_weight_storage_table_bf16`` builds
     one).  The three routed weights are then the representative expert alone and the kernel names
     the others through per-expert TMA descriptors.  The tables join the plan key, so a rebuilt
     table is a new plan and a kept one can never be stale.

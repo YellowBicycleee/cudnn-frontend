@@ -22,7 +22,7 @@ from cutlass import Float32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ._quack.activation import swiglu
+from ._compat.activation import swiglu
 
 from ._mxfp8_quant import fma_ftz, mul_ftz
 

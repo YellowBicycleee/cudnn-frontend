@@ -155,7 +155,7 @@ def _device_ops(config: CuteMoKConfig):
     _validate_config_type(config)
     global _CUTEDSL_OPS
     if _CUTEDSL_OPS is None:
-        # CUTLASS and the vendored QuACK modules are imported on first use, not at `import cudnn.moe_dispatch_mlp_combine`.
+        # CUTLASS and the helpers adapted from QuACK are imported on first use, not at `import cudnn.moe_dispatch_mlp_combine`.
         from .cutedsl.all_gather_top_experts import all_gather_top_experts as cutedsl_all_gather
         from .cutedsl.barrier_all import barrier_all as cutedsl_barrier_all
         from .cutedsl.bwd_epilogue import bwd_epilogue_bf16

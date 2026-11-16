@@ -69,12 +69,10 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import LayoutEnum, block_copy
 
-from ._quack import copy_utils
-from ._quack.activation import dswiglu
-from ._quack.gemm_base import NamedBarrierGemm
-from ._quack.gemm_default_epi import GemmDefaultSm100
-from ._quack.pipeline import PipelineTmaUmma, PipelineUmmaAsync
-from ._quack.varlen_utils import VarlenArguments
+from ._compat import copy_utils
+from ._compat.activation import dswiglu
+from ._compat.gemm_sm100 import GemmDefaultSm100, NamedBarrierGemm, VarlenArguments
+from ._compat.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
 from ._mxfp8_bwd_math import situ_bwd
 

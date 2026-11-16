@@ -580,7 +580,7 @@ _EXECUTING = threading.local()
 
 @contextlib.contextmanager
 def compiled_only():
-    """The execute step of a plan (``cutemok.functional.forward_execute``): inside, a kernel variant that is not in
+    """The execute step of a plan (``cudnn.moe_dispatch_mlp_combine.functional.forward_execute``): inside, a kernel variant that is not in
     its process cache raises instead of being compiled or loaded.  The plan step compiles every variant its
     configuration launches, so a miss here is a call the plan was not made for -- and under a CUDA graph capture
     a compile would run in the middle of the recording.  Every ``cute.compile`` of the package goes through

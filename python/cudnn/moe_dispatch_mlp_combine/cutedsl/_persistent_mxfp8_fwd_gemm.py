@@ -31,10 +31,9 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils import LayoutEnum
 
-from ._quack import copy_utils
-from ._quack.gemm_default_epi import GemmDefaultSm100
-from ._quack.layout_utils import tile_atom_to_shape_SF_strided
-from ._quack.varlen_utils import VarlenArguments
+from ._compat import copy_utils
+from ._compat.gemm_sm100 import GemmDefaultSm100, VarlenArguments
+from ._compat.layout_utils import tile_atom_to_shape_SF_strided
 from ._mxfp8_bwd_math import glu_forward
 
 from ._mxfp8_quant import (

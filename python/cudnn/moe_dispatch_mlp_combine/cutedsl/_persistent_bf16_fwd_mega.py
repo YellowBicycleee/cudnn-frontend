@@ -57,8 +57,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ._mxfp8_bwd_math import glu_forward
-from ._quack.gemm_base import NamedBarrierGemm
-from ._quack.pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from ._compat.gemm_sm100 import NamedBarrierGemm
+from ._compat.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
 from ._persistent_bf16_fwd_gemm import (
     AB_STAGES as _GATE_AB_STAGES,

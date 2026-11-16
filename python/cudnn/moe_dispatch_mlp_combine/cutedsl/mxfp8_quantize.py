@@ -4,7 +4,7 @@
 # Derived from Mixture-of-Kittens (https://github.com/cursor/mixture-of-kittens, commit 22fc95ae);
 # ported to CuTe DSL and modified by NVIDIA.
 
-"""BF16 -> MXFP8 quantization kernel on SM100 / SM103 (the implementation of ``cutemok.ops.mxfp8_quantize``).
+"""BF16 -> MXFP8 quantization kernel on SM100 / SM103 (the implementation of ``cudnn.moe_dispatch_mlp_combine.ops.mxfp8_quantize``).
 
 One CTA per 128 x 128 tile: the e4m3 payload plus one e8m0 scale per 32 elements, in the normal
 and/or the transposed layout.  The quantization itself is ``_mxfp8_quant.quantize_tile``, shared

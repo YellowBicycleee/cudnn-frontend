@@ -200,7 +200,7 @@ every rank calls them in the same order with the same $T$ (not checked: a check 
 ## Source and tests
 
 Source: `python/cudnn/moe_dispatch_mlp_combine/` (`api.py` the operator functions, `functional.py` the layer
-interface they call, `cutedsl/` the kernels and their hosts, `cutedsl/_quack/` the vendored QuACK modules). The
+interface they call, `cutedsl/` the kernels and their hosts, `cutedsl/_compat/` the helpers adapted from QuACK). The
 layer interface (`get_workspace`, `build_schedule`, `forward`, `backward`) and the helpers named above are
 imported from the package and are not exported from `cudnn.ops`.
 

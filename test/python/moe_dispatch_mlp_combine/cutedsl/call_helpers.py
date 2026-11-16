@@ -1,5 +1,8 @@
+# Copyright 2026 Cursor Research
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# generate_inputs is derived from the test utilities of Mixture-of-Kittens
+# (https://github.com/cursor/mixture-of-kittens, commit 22fc95ae); modified by NVIDIA.
 
 """Helpers of the tests that call the layer the way MCore does: inputs, call arguments, precision."""
 

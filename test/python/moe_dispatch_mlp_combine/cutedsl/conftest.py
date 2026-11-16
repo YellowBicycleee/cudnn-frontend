@@ -12,6 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from cudnn.moe_dispatch_mlp_combine import functional
 from cudnn.moe_dispatch_mlp_combine.functional import clear_workspace_cache
 from cudnn.moe_dispatch_mlp_combine.cutedsl._version_gate import CuteDslRequirementError
 
@@ -69,3 +70,20 @@ def context() -> Iterator[tuple[int, int, torch.device]]:
         clear_workspace_cache()
         gc.collect()
         dist.destroy_process_group()
+
+
+@pytest.fixture(autouse=True)
+def _release_workspaces() -> Iterator[None]:
+    """Release the cached workspaces after every test.  A test module runs many tests in one process; each workspace
+    holds symmetric memory with multicast addresses, and an EP group runs out of them when the workspaces of many
+    shapes stay cached until the session ends.  The compiled executors stay cached."""
+    yield
+    if not (dist.is_available() and dist.is_initialized()) or not functional._WORKSPACE_CACHE:
+        return
+    from cudnn.moe_dispatch_mlp_combine.cutedsl.barrier_all import barrier_all
+
+    for workspace in functional._WORKSPACE_CACHE.values():
+        barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs, workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
+        torch.cuda.synchronize(workspace.device)
+    functional._WORKSPACE_CACHE.clear()
+    gc.collect()

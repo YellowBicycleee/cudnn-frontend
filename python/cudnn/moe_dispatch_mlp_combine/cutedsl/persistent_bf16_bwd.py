@@ -1298,7 +1298,7 @@ def backward_bf16(
     weights and partials (macrobatch-sized), see _PersistentBf16BwdPreparation.
 
     ``routed_storage_tables`` are the Gate, Up and Down per-expert base addresses when the routed
-    experts are independent per-expert allocations (``cutemok.ops.make_routed_weight_storage_table_bf16``
+    experts are independent per-expert allocations (``cudnn.moe_dispatch_mlp_combine.ops.make_routed_weight_storage_table_bf16``
     builds one).  The three routed weights are then the representative expert alone and the dgrad
     names the others through per-expert TMA descriptors; ``up_row_offset`` is the Up half's first
     row inside a combined FC1 parameter, which a retargeted descriptor cannot express as a

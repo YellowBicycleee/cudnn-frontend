@@ -160,17 +160,13 @@ Selected helper routines in the block-sparse attention CuTe DSL utilities
 quack-kernels 0.4.1 and maintained locally. Those files retain the
 'QuACK team' copyright notice in their headers.
 
-The CuTe DSL modules under
-python/cudnn/moe_dispatch_mlp_combine/cutedsl/_quack/ are vendored from
-quack-kernels 0.5.0 (the SM100 GEMM collective the MoE megakernels build on,
-its pipelines, tile scheduler, copy and layout helpers, and the SwiGLU
-activation) and maintained locally; VENDOR.md in that directory lists the
-files and the local changes. Those files retain their original copyright
-notices in their headers (Tri Dao; Wentao Guo, Tri Dao; Wentao Guo, Ted
-Zadouri, Tri Dao; Vijay Thakkar, Tri Dao; QuACK team). QuACK's SM90 / SM100 /
-SM120 GEMM modules note in their headers that they are based on the CUTLASS
-CuTe DSL examples (entry 3). QuACK's license file is also kept as LICENSE in
-that directory.
+Selected helper routines of the MoE dispatch, MLP and combine CuTe DSL
+kernels (python/cudnn/moe_dispatch_mlp_combine/cutedsl/_compat/) are adapted
+from quack-kernels 0.5.0 and maintained locally. Those files retain their
+original copyright notices in their headers (Tri Dao; Wentao Guo, Tri Dao;
+Wentao Guo, Ted Zadouri, Tri Dao; Vijay Thakkar, Tri Dao; QuACK team).
+gemm_sm100.py there notes in its header, as QuACK's GEMM module does, that it
+is based on the CUTLASS CuTe DSL examples (entry 3).
 
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)
 

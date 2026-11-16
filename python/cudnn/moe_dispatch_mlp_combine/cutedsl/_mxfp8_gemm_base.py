@@ -25,8 +25,7 @@ from cutlass import BFloat16, Float32, Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils import LayoutEnum, block_copy
 
-from ._quack.gemm_default_epi import GemmDefaultSm100
-from ._quack.varlen_utils import VarlenArguments
+from ._compat.gemm_sm100 import GemmDefaultSm100, VarlenArguments
 from ._bwd_device_helpers import named_barrier_sync_unaligned
 
 TILE_M = 256

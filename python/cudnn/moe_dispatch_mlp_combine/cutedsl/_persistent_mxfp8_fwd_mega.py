@@ -88,7 +88,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import LayoutEnum
 
 from ._mxfp8_bwd_math import glu_forward
-from ._quack.pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from ._compat.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
 from . import _mxfp8_gemm_base as gemm
 from . import _persistent_mxfp8_fwd_gemm as mxgemm

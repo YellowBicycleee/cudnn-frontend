@@ -60,7 +60,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
 
-from ._quack.pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from ._compat.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
 from . import _mxfp8_bwd_swiglu as swiglu_bwd
 from . import _mxfp8_gemm_base as gemm

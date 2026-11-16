@@ -8,7 +8,7 @@
 all-gather, EP barrier, scheduler, MXFP8 quantize, routed-row copy, forward / backward epilogue) and
 the per-expert address tables of split routed weights.
 
-The functions import ``cudnn.moe_dispatch_mlp_combine.cutedsl`` inside the call rather than at module scope.  ``cudnn.moe_dispatch_mlp_combine/__init__``
+The functions import ``cudnn.moe_dispatch_mlp_combine.cutedsl`` inside the call rather than at module scope.  ``cudnn/moe_dispatch_mlp_combine/__init__``
 imports this module, so a module-scope import would pull CUTLASS (and the version check and device probe of
 the kernel modules) into every ``import cudnn.moe_dispatch_mlp_combine``, including a caller that only wanted
 ``cudnn.moe_dispatch_mlp_combine.functional.CuteMoKConfig``.

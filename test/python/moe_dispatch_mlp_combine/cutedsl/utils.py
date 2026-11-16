@@ -48,8 +48,8 @@ MXFP8_TOLERANCE = (1.0, 0.1)
 # outside MXFP8_TOLERANCE's absolute bound on the tests' inputs, and this implementation returns upstream's bytes:
 # (world size, case, SwiGLU mode, result) -> upstream's abs max, which is that result's absolute bound (an exact
 # binary fraction, no margin).  Measured on GB300 at 8 ranks; every other case, result and world size keeps
-# MXFP8_TOLERANCE.  validate/README.md has the measurements, what is known of the cause, and the scripts that
-# repeat them.
+# MXFP8_TOLERANCE.  Each value was measured by running upstream and this implementation on the same inputs (seed
+# 1234) and comparing the two results tensor by tensor.
 MXFP8_UPSTREAM_ABS_MAX = {
     # One local expert per rank, hidden 256, intermediate 256, top-k 1, 512 local tokens; every MoK parameter set.
     (8, "All minimums", "Clamped SwiGLU", "d_w_routed_gate"): 1.0859375,
