@@ -8,7 +8,7 @@
 
 A grouped routed weight needs no help: it is one ``(N, K, E)`` tensor, so one descriptor covers
 every expert and the kernel slices the L mode.  Split allocations agree on dtype, shape and
-stride and differ only in base address, which is all ``functional.SplitRoutedWeight``'s table
+stride and differ only in base address, which is all ``functional.CuteMoKSplitWeight``'s table
 carries; they have no common L stride, so the descriptor has to name the expert's own base
 address.
 

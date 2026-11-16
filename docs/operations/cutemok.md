@@ -1,221 +1,123 @@
 # CuTe MoK
 
-**Experimental.** CuTe MoK is a MoE dispatch, expert MLP and combine operation written in CuTe DSL (package
-`cudnn.moe_ep.cutemok`). `cudnn.ops.mok_forward` and `cudnn.ops.mok_backward` run one expert-parallel
-mixture-of-experts layer: each rank's tokens are dispatched to the ranks that own their top-k experts, the routed
-experts' gated MLPs (and an optional shared expert's) are computed, and the results are combined back on the
-tokens' rank. The forward and the backward are each one persistent megakernel that overlaps the cross-rank token
-traffic with the expert GEMMs, plus a few small launches listed under [Launches per call](#launches-per-call).
+`cudnn.moe_ep.cutemok` exposes the experimental CuTe MoK API: one expert-parallel
+mixture-of-experts layer. Each rank's tokens are dispatched to the ranks that own
+their top-k experts, the routed experts' SwiGLU MLPs (and an optional shared
+expert's) are computed, and the results are combined back on the tokens' rank.
+The forward and the backward are each one persistent CuTe DSL megakernel that
+overlaps the cross-rank token traffic with the expert GEMMs, plus a few small
+launches (route all-gather, scheduler, staging copies, barriers, epilogue).
+Routed weights are BF16 or MXFP8. The operator is derived from
+[Mixture-of-Kittens](https://github.com/cursor/mixture-of-kittens) by Cursor
+Research, whose megakernels are written in CUDA C++. It is separate from `MoeEp`
+and from Cake MoK (`cudnn.moe_ep.cake`).
 
-The operator is derived from [Mixture-of-Kittens](https://github.com/cursor/mixture-of-kittens) by Cursor
-Research, whose megakernels are written in CUDA C++;
-see its [README](https://github.com/cursor/mixture-of-kittens/blob/main/README.md) and
-[blog post](https://cursor.com/blog/mixture-of-kittens) for the design, and [Citation](#citation).
-
-Cake MoK ([`cudnn.moe_ep.cake`](/operations/cake_mok): `prepare_mok_training`, `create_mok_workspace`,
-`quantize_mok_weights`) is a separate implementation that also derives from Mixture-of-Kittens: a training
-adapter built from generated CUDA. CuTe MoK is the CuTe DSL implementation, with the prepare / forward / backward
-plan interface described here.
-
-A layer runs in two steps, with the same division of work as the MoeEP operation (`cudnn.MoeEp`):
-
-- **Prepare**, once per layer configuration: `cudnn.ops.mok_prepare(...)` compiles every kernel the forward and
-  backward launch and allocates the symmetric-memory buffers, counters and scratch they use. It returns a
-  `cudnn.ops.CuteMoKPlan`.
-- **Execute**, every step: the forward and backward take the plan and the caller's output buffers. They compile
-  nothing, allocate no device memory (one exception: [split routed weights](#options)) and never read device
-  memory back to the host.
-
-## Operation
-
-Let rank $r$ hold $T$ tokens $x_t \in \mathbb{R}^{H}$. Token $t$ selects up to $K$ global experts $e_{t,k}$
-with router weights $p_{t,k}$; $e_{t,k} = -1$ marks an unused slot. With $E$ global experts over $P$ ranks,
-each rank owns $E_{\mathrm{local}} = E / P$ consecutive experts. Weights are stored `[out, in]`. For a routed
-expert $e$ with $W^{g}_{e}, W^{u}_{e} \in \mathbb{R}^{I \times H}$ and $W^{d}_{e} \in \mathbb{R}^{H \times I}$:
-
-$$
-g_{t,k} = x_t {W^{g}_{e_{t,k}}}^{\top},\qquad
-u_{t,k} = x_t {W^{u}_{e_{t,k}}}^{\top},\qquad
-h_{t,k} = \mathrm{SiLU}(g_{t,k}) \odot u_{t,k},\qquad
-z_{t,k} = h_{t,k} {W^{d}_{e_{t,k}}}^{\top}.
-$$
-
-The shared expert computes $s_t$ the same way from $W^{g}_{s}, W^{u}_{s}, W^{d}_{s}$ (no routing), and the
-output is
-
-$$
-y_t = s_t + \sum_{k:\, e_{t,k} \ge 0} p_{t,k}\, z_{t,k}.
-$$
-
-The router weight is applied to the Down output, during the combine. The backward returns
-$\partial L/\partial x$, $\partial L/\partial p_{t,k} = \langle \partial L/\partial y_t,\ z_{t,k}\rangle$
-(zero at unused slots) and the gradients of all six weights. The equations describe the mathematics: GEMM
-operands and the saved activations are BF16 (or MXFP8, below), accumulation is FP32.
-
-Options change the MLP:
-
-| Option | Effect |
-|---|---|
-| `swiglu_limit=C` | clamped SwiGLU: $\min(g, C)$ for the gate and $\mathrm{clip}(u, -C, C)$ for the up projection |
-| `situ_beta=(\beta_1, \beta_2)` | SiTU-GLU instead of SwiGLU: $h = \beta_1 \tanh(g/\beta_1)\,\sigma(g) \cdot \beta_2 \tanh(u/\beta_2)$ |
-| `shared_output_gate=G` (forward) | $y_t = G_t\, s_t + \sum_k p_{t,k} z_{t,k}$ with the caller's $G = \sigma(x w^{\top})$, BF16 `[T, 1]`; its backward is not available in this API |
-| no shared expert | pass `None` for the three shared weights: $y_t$ is the routed sum |
-| combined FC1 | pass one `[E_local, 2I, H]` tensor as both routed gate and up weights (gate rows first) |
-| `routed_hidden_size=R` (prepare) | the routed experts work in width $R \ne H$ on `routed_input` `[T, R]`; the forward returns the pair $(s, \sum_k p z)$ and the backward takes `routed_grad_output` |
-
-## Usage
+Requirements: SM100 or SM103 (B200, B300, GB200, GB300); `nvidia-cutlass-dsl[cu13]
+>= 4.8.0` in its cu13 build (a lower version or the cu12 build is declined with an
+error naming it); PyTorch 2.9 or later built for CUDA 13; an initialized NCCL
+process group of 1, 4, 8, 16, 32 or 64 ranks whose GPUs share PyTorch symmetric
+memory.
 
 ```python
-import torch
-import torch.distributed as dist
 import cudnn
 
-config = cudnn.ops.CuteMoKConfig(
-    fwd_num_comm_sms=40, bwd_num_comm_sms=28,       # SMs each megakernel gives to communication
-    fwd_minibatch_size=4096, bwd_minibatch_size=8192,
-    macrobatch_size=131072,
+config = cudnn.ops.CuteMoKConfig(fwd_num_comm_sms=40, bwd_num_comm_sms=28,
+                                 minibatch_size=4096, macrobatch_size=131072)
+plan = cudnn.ops.cutemok_prepare(  # once; serves every layer of this configuration
+    config, group, device=device, max_tokens_per_rank=16384, hidden_size=H,
+    intermediate_size=I, num_local_experts=E_local, topk=K,
 )
-plan = cudnn.ops.mok_prepare(  # collective over the group, outside graph capture
-    config, dist.group.WORLD, device=torch.device("cuda", local_rank),
-    max_tokens_per_rank=16384, hidden_size=H, intermediate_size=I, num_local_experts=E_local, topk=K,
+weights = (shared_gate, shared_up, shared_down, routed_gate, routed_up, routed_down)
+y, schedule, saved = cudnn.ops.cutemok_forward(
+    x, top_experts, router_weights, *weights, plan=plan, config=config,
 )
-
-def empty(shape, dtype=torch.bfloat16):            # buffers of the plan's *_shapes
-    if shape is None:
-        return None
-    if isinstance(shape[0], int):
-        return torch.empty(shape, dtype=dtype, device="cuda")
-    if isinstance(shape[1], torch.dtype):           # MXFP8 context: (shape, dtype)
-        return torch.empty(shape[0], dtype=shape[1], device="cuda")
-    return tuple(empty(item, dtype) for item in shape)
-
-context_shapes, out_shape = plan.forward_shapes(config, T)
-d_x_shape, d_router_shape, d_weight_shapes = plan.backward_shapes(T)
-schedule_out = empty(plan.schedule_shapes(T), torch.int32)
-context_out, out = empty(context_shapes), empty(out_shape)
-d_x, d_router = empty(d_x_shape), empty(d_router_shape, torch.float32)
-d_weights = empty(d_weight_shapes)
-
-weights = (w_shared_gate, w_shared_up, w_shared_down, w_routed_gate, w_routed_up, w_routed_down)
-y, schedule, saved = cudnn.ops.mok_forward(
-    x, top_experts, router_weights, *weights,
-    plan=plan, config=config, out=out, context_out=context_out, schedule_out=schedule_out,
-)
-(d_x, d_router_weights, d_w_routed_gate, d_w_routed_up, d_w_routed_down,
- d_w_shared_gate, d_w_shared_up, d_w_shared_down, _) = cudnn.ops.mok_backward(
-    d_y, x, router_weights, *weights, schedule, saved,
-    plan=plan, config=config, out=d_x, d_router_weights_out=d_router, d_weights_out=d_weights,
+grads = cudnn.ops.cutemok_backward(
+    dy, x, router_weights, *weights, schedule, saved, plan=plan, config=config,
 )
 ```
 
-Both functions return a `TupleDict`, which unpacks as above and is also read by name: the forward's keys are
-`output`, `schedule` and `forward_context`; the backward's are `d_x`, `d_router_weights`, `d_w_routed_gate`,
-`d_w_routed_up`, `d_w_routed_down`, `d_w_shared_gate`, `d_w_shared_up`, `d_w_shared_down` and `d_w_output_gate`
-(always `None` in this API).
+`x[T,H]` and `dy[T,H]` are BF16 with T a multiple of 256 in
+`[512, max_tokens_per_rank]`. `top_experts[T,K]` is int32 global expert ids, `-1`
+for an unused slot; `router_weights[T,K]` is FP32. Shared gate/up are `[I,H]`,
+shared down `[H,I]`, or three `None` for a plan prepared with `has_shared=False`;
+routed weights add an expert axis of `E_local`. H and I are multiples of 128 and
+at least 256; top-k is in `[1, 255]`. Activations and routing are contiguous;
+another dtype or layout, or routed weights in another form than the plan's, is
+declined with `NotImplementedError` naming the tensor before anything launches.
+Rank r owns experts `[r * E_local, (r + 1) * E_local)`; the output is the shared
+expert's plus the router-weighted sum of the routed experts' outputs.
+The forward returns a `TupleDict` with `output`, `schedule` and `forward_context`;
+the backward's keys are `d_x`, `d_router_weights`, `d_w_routed_gate`,
+`d_w_routed_up`, `d_w_routed_down`, `d_w_shared_gate`, `d_w_shared_up`,
+`d_w_shared_down` and `d_w_output_gate` (always `None`). Outputs and weight
+gradients are BF16, router-weight gradients FP32 (zero at unused slots).
 
-`y` is `out`, `schedule` lives in `schedule_out` and `saved` in `context_out`: keep those buffers untouched
-from the forward to its backward. The backward writes into `d_x`, `d_router` and `d_weights`. With `main_grads`
-instead of `d_weights_out` it accumulates the weight gradients into the caller's buffers (FP32 or BF16, the
-dtype given to `prepare` as `main_grad_dtype`).
+`cutemok_prepare`, collective over the group and outside graph capture, compiles
+every kernel the forward and backward launch and allocates the plan's workspace:
+PyTorch symmetric memory sized for `max_tokens_per_rank` (T_max). Two BF16
+`[T_max * K, H]` buffers, the routed rows' expert outputs and input gradients
+(`4 * T_max * K * H` bytes together), dominate it; the rest are two BF16
+`[T_max, H]` staging buffers, the FP32 `[T_max, K]` router weights and their
+gradients, the int32 `[ranks, T_max, K]` gathered routes and a barrier word. The
+plan also holds the megakernels' counters and scratch (sized by the config's
+macrobatch).
 
-One plan serves every token count $T$ up to `max_tokens_per_rank`; `config` may change between calls in its
-runtime fields (communication SMs, minibatch sizes, a macrobatch up to the plan's), and none of them compiles a
-new kernel. Calls on one plan share its buffers and must not overlap: issue them in one stream order.
+Forward and backward are allocating eager calls: they allocate their results with
+`torch.empty` on the current stream's device on every call, nothing cached across
+calls, and return them; they compile nothing and never read device memory to the
+host. The first call over new `CuteMoKSplitWeight` address tables also allocates
+and builds their TMA descriptors, once per set of tables. The schedule and the
+forward context hold the backward's inputs: keep them until the backward.
 
-### Tensors
+The plan owns its workspace; nothing caches or shares it. One plan can serve every
+layer of the same configuration: pass it to each of them (two plans have two
+workspaces). Calls on one plan share its buffers: issue them in one stream order,
+on every rank in the same order with the same T. Retain the plan until all eager
+calls and graph replays that use it have finished on every rank, then drop it on
+every rank, outside graph capture, to free the workspace: synchronize first (for
+example `torch.cuda.synchronize()` and a barrier over the group), since the other
+ranks write into its buffers.
 
-| Argument | Shape and dtype |
-|---|---|
-| `x`, `d_y` | BF16 `[T, H]`, contiguous |
-| `top_experts` | int32 `[T, K]`, contiguous; global expert ids, `-1` for an unused slot |
-| `router_weights` | FP32 `[T, K]`, contiguous |
-| `w_shared_gate`, `w_shared_up` | BF16 `[I, H]` |
-| `w_shared_down` | BF16 `[H, I]` |
-| `w_routed_gate`, `w_routed_up` | BF16 `[E_local, I, H]` |
-| `w_routed_down` | BF16 `[E_local, H, I]` |
-| `out`, `d_x` | BF16 `[T, H]` |
-| `d_router_weights_out` | FP32 `[T, K]` |
-| `d_weights_out` | six BF16 buffers shaped like the weights, ordered shared / routed per matrix (gate, up, down) |
+Warm each variant up with an eager forward and backward before capturing it in a
+CUDA graph; a variant the plan did not compile raises `RuntimeError` instead of
+compiling. Captured calls allocate their results in the graph's private pool,
+which the graph retains; keep the graph and its plan alive for all replays. A
+graph replays its own T and input addresses; their contents, routing included,
+may change between replays.
 
-### MXFP8 routed weights
+The token count and the `CuteMoKConfig` runtime fields (communication SMs per
+direction, minibatch sizes, a macrobatch up to the plan's) may change on every
+call and compile nothing. Variants are compile-time choices of prepare:
+`swiglu_clamped` (forward and backward then take `swiglu_limit=C`:
+`silu(min(gate, C)) * clip(up, -C, C)`), `situ` (SiTU-GLU, `situ_beta`),
+`has_shared`, `shared_output_gate` (forward only), `split_routed_weights`,
+`main_grad_dtype`, `routed_precision`, `native_columnwise` and the config's
+`gate_up_context`, `comm_tile_shape` and `epilogue_combine`. One
+`[E_local, 2I, H]` tensor passed as both routed gate and up is a combined FC1.
+The routed rows a rank receives, padded to 256 per local expert, must fit the
+schedule of `T * K * max(2, ceil(ranks * config.schedule_capacity_multiplier))`
+rows; a schedule that does not fit stops the kernel with a device-side trap.
 
-Prepare with `routed_precision="mxfp8"` and pass the routed weights prequantized to MXFP8 (E4M3 payload with
-one E8M0 scale per 32 elements, `cudnn.moe_ep.cutemok.ops.mxfp8_quantize`): the forward takes
-`(e4m3, scale)` per matrix; the backward takes `(e4m3, scale, e4m3_t, scale_t)` for gate and up and
-`(e4m3_t, scale_t)` for down. Activations, outputs and gradients stay BF16; the kernels quantize x and the
-hidden activations on the fly. `config.gate_up_context` selects the precision of the routed gate / up
-activations kept for the backward: `"mxfp8"` (default) or `"bf16"` (more memory, no requantization).
-`prepare(native_columnwise=True)` accepts TransformerEngine's columnwise payload layout for the transposed
-operands.
+For MXFP8 routed weights, prepare with `routed_precision="mxfp8"` and call
+`cudnn.ops.cutemok_quantize_weights(gate, up, down)` after every weight update. It
+returns a `TupleDict` of `forward_weights` and `backward_weights`, each splatted as
+the routed weights of its call. I and H must be multiples of 128; shared weights,
+activations and gradients stay BF16. `config.gate_up_context` keeps the routed
+gate/up activations as MXFP8 (default) or BF16.
 
-### Options
+Routed experts held in separate allocations are passed as
+`CuteMoKSplitWeight.from_experts(tensors)`, one per routed matrix (one
+`[2I, H]` tensor per expert for a combined FC1). Prepare with
+`split_routed_weights=True` and `main_grad_dtype`; the backward then takes
+`main_grads` (FP32 or BF16 buffers it accumulates into, instead of returning
+new weight gradients) and `main_grad_storage_tables`, the per-expert main-grad
+addresses as int64 CUDA tensors. Build the weights and tables once; again only
+when an allocation moves. The backward of a shared output gate and a backward
+from a forward context without its routed activations are not part of this API.
 
-- Split routed weights: per-expert allocations passed as `SplitRoutedWeight` (in
-  `cudnn.moe_ep.cutemok.functional`) with a table of their addresses; prepare with
-  `split_routed_weights=True` and accumulate into `main_grads` (with `main_grad_storage_tables`). The first call
-  over a new set of address tables allocates and builds their TMA descriptors once (one small launch per routed
-  operand); later calls over the same tables reuse them.
-- Variants are compile-time choices made at prepare: `swiglu_clamped`, `situ`, `has_shared`,
-  `shared_output_gate`, `split_routed_weights`, `main_grad_dtype`, `routed_precision`, `native_columnwise`,
-  `config.gate_up_context` and `config.comm_tile_shape` (BF16 only: rows x columns of one communication tile,
-  `(32, 512)`, `(16, 1024)`, or `"auto"`: 16 x 1024 when the routed hidden size is a multiple of 1024). Executing a variant the plan did
-  not compile raises `RuntimeError` instead of compiling.
-- `zero_unrouted_router_grads=False` skips the masking of unused slots in `d_router_weights`, whose values there
-  are then unspecified.
-
-## Launches per call
-
-| Call | Launches, in order |
-|---|---|
-| forward, routing | route all-gather → EP barrier → scheduler (three kernels) |
-| forward, BF16 | staging of x and the router weights into symmetric memory (one kernel copying the routed rows; two copies when x is not 256-byte aligned or the routed hidden differs) → EP barrier → counter reset (memset) → forward megakernel → EP barrier → combine epilogue |
-| forward, MXFP8 | two staging copies → EP barrier → counter reset → forward megakernel → EP barrier → combine epilogue |
-| backward, BF16 | staging of dY, x and the router weights (one kernel, or three copies as above) → EP barrier → counter reset → metadata builder → backward megakernel → EP barrier → dX epilogue → copy of the router-weight gradients → compare and masked fill of the unused slots (with `zero_unrouted_router_grads`) |
-| backward, MXFP8 | three staging copies → EP barrier → counter reset → backward megakernel (one compiled call with its tensormap prologue and, without `main_grads`, the zeroing of empty experts' weight gradients) → EP barrier → dX epilogue → router-weight gradient copy → masking of the unused slots |
-
-All launches go to the current stream. The forward and backward are collective over the plan's process group:
-every rank calls them in the same order with the same $T$ (not checked: a check would read device memory).
-
-## CUDA graphs
-
-- Prepare outside capture. The first forward / backward after prepare can be captured without an eager warm-up:
-  nothing is compiled inside the capture, and a variant the plan did not compile raises there.
-- A graph replays its own $T$ and addresses: inputs, weights, `out`, `context_out`, `schedule_out` and the
-  gradient buffers must keep their addresses until every graph that uses them is destroyed. Their contents,
-  including the routing, may change between replays. The plan's counters, scratch and symmetric buffers have
-  fixed addresses for the plan's lifetime.
-- Capture and replay on every rank in the same order, on one stream per plan; graphs that share a plan must not
-  replay concurrently.
-
-## Support
-
-| Question | Answer |
-|---|---|
-| Device | NVIDIA Blackwell, compute capability 10.0 or 10.3 (B200, B300, GB200, GB300) |
-| EP group | 1, 4, 8, 16, 32 or 64 ranks whose GPUs share PyTorch symmetric memory |
-| Tokens per rank | a multiple of 256, at least 512, at most `max_tokens_per_rank` |
-| Sizes | hidden and intermediate sizes multiples of 128 and at least 256 (a different routed hidden size: a multiple of 256); top-k in `[1, 255]` |
-| Config | minibatch sizes multiples of 256 that divide the macrobatch; an even number of communication SMs |
-| Routing | the routed rows a rank receives, padded to 256 per local expert, must fit the schedule of $T \cdot K \cdot \max(2, \lceil P \cdot m \rceil)$ rows with $m$ = `config.schedule_capacity_multiplier`; a schedule that does not fit stops the kernel with a device-side trap |
-| Dtypes | BF16 activations and weights, or MXFP8 routed weights; FP32 router weights; int32 routing |
-| Layouts | contiguous `[T, ...]` activations and routing; anything else is declined with `NotImplementedError` naming the tensor |
-| Not in this API | the backward of a layer with a shared output gate; a backward from a forward context without its routed activations (the replay of the first macrobatch) |
-| Software | PyTorch 2.9 or later built for CUDA 13 (`pip install --group torch`); `nvidia-cutlass-dsl[cu13] >= 4.8.0` in its cu13 build (a lower version or the cu12 build is declined with an error naming it) |
-
-## Source and tests
-
-Source: `python/cudnn/moe_ep/cutemok/` (`api.py` the operator functions, `functional.py` the layer
-interface they call, `cutedsl/` the kernels and their hosts, `cutedsl/_compat/` the helpers adapted from QuACK). The
-layer interface (`get_workspace`, `build_schedule`, `forward`, `backward`) and the helpers named above are
-imported from the package and are not exported from `cudnn.ops`.
-
-Tests: `test/python/moe_ep/cutemok/`. The host-only tests run anywhere; the tests that need an EP
-group run under `torchrun` on SM100 / SM103 GPUs that share symmetric memory, for example
-`torchrun --standalone --nproc-per-node=8 -m pytest moe_ep/cutemok/test_api.py` from
-`test/python`, and skip elsewhere.
-
-## Citation
-
-```
-Stuart H. Sul, Nash Brown, Henry Wildermuth, William Lin, and Federico Cassano. "Mixture-of-Kittens: MoE Megakernel for NVL72s." Cursor Research, Aug 2026. https://github.com/cursor/mixture-of-kittens
-```
+The public module is `python/cudnn/moe_ep/cutemok.py`; the implementation is the
+private package `python/cudnn/moe_ep/_cutemok/` (`functional.py`, `ops.py`,
+`cutedsl/` with the kernels and hosts, `cutedsl/_compat/` with helpers adapted
+from QuACK). `_cutemok/UPSTREAM.md` records the sources. Tests are in
+`test/python/moe_ep/cutemok/test_cutemok.py`; they run on one GPU under pytest and
+expert-parallel under `torchrun`.

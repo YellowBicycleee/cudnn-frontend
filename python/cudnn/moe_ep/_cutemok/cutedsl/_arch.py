@@ -8,7 +8,7 @@
 the options of every ``cute.compile`` of the package.
 
 The target is resolved once, from the current CUDA device, when the first kernel module imports this one (on the
-first call; ``import cudnn.moe_ep.cutemok`` does not).  With no visible or no supported device the default is sm_103a and the
+first call; ``import cudnn.moe_ep._cutemok`` does not).  With no visible or no supported device the default is sm_103a and the
 per-call device check rejects a launch on the wrong part.  ``COMPILE_OPTIONS`` passes the target and TVM FFI to
 each compile (``--gpu-arch``, ``--enable-tvm-ffi``), so CuteMoK sets no environment variable and does not care
 whether CUTLASS was imported before it: ``CUTE_DSL_ARCH`` and ``CUTE_DSL_ENABLE_TVM_FFI`` need not be set.

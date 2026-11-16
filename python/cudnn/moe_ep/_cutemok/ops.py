@@ -6,15 +6,15 @@
 
 """The operators around the megakernels: thin forwarding functions to the CuTe DSL kernels (route
 all-gather, EP barrier, scheduler, MXFP8 quantize, routed-row copy, forward / backward epilogue) and
-the per-expert address tables of split routed weights.
+the per-expert address tables of split routed weights.  An implementation module: the public API is
+``cudnn.moe_ep.cutemok``.
 
-The functions import ``cudnn.moe_ep.cutemok.cutedsl`` inside the call rather than at module scope.  ``cudnn/moe_ep/cutemok/__init__``
-imports this module, so a module-scope import would pull CUTLASS (and the version check and device probe of
-the kernel modules) into every ``import cudnn.moe_ep.cutemok``, including a caller that only wanted
-``cudnn.moe_ep.cutemok.functional.CuteMoKConfig``.
+The functions import ``cudnn.moe_ep._cutemok.cutedsl`` inside the call rather than at module scope, so importing this module
+(``cudnn.moe_ep.cutemok`` does) does not pull CUTLASS, the version check and the device probe of the kernel modules into a
+caller that only wanted ``CuteMoKConfig``.
 
 These are plain Python functions, not ``torch.library`` custom ops: there are no fake / meta
-implementations.  The megakernels are called through ``cudnn.moe_ep.cutemok.functional``, which is not traceable.
+implementations.  The megakernels are called through ``cudnn.moe_ep._cutemok.functional``, which is not traceable.
 """
 
 import torch  # noqa: F401

@@ -1371,7 +1371,7 @@ def compile_forward_mxfp8(
     tail (from the workspace and ``intermediate_size``).  Sizes are runtime values of the kernel, so every tensor
     argument of the compile is a stand-in of the right rank and dtype: the device's 256 x 256 BF16 tile for the
     shared weights and outputs, a 256-row state of one expert for the routed ones, one int32 word for the
-    schedule.  The workspace gives the peer address tables, which this builds too.  A later ``forward_mxfp8``
+    schedule.  The workspace gives the peer address tables (``create_workspace`` built them).  A later ``forward_mxfp8``
     over real tensors computes the same key and finds the executor.
     """
     import torch

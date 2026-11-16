@@ -234,6 +234,20 @@ def workspace_peer_tables(workspace) -> dict:
     return tables
 
 
+#: The workspace's symmetric buffers whose peer addresses the megakernels read from a device table.
+PEER_TABLE_BUFFERS = ("x_buffer", "combine_buffer", "d_y_buffer", "d_x_routed_buffer", "router_weight_buffer", "d_router_weight_buffer")
+
+
+def build_workspace_peer_tables(workspace) -> None:
+    """Build every peer address table of the workspace (one host-to-device copy each) when it is created, so that
+    no forward or backward builds one: inside a CUDA graph capture that copy fails.  The views of the workspace
+    (``CuteMoKPlan.workspace_for``) share its table dict."""
+
+    tables = workspace_peer_tables(workspace)
+    for name in PEER_TABLE_BUFFERS:
+        peer_address_table(getattr(workspace, f"{name}_ptrs"), workspace.device, tables)
+
+
 def tensor_layout_signature(tensors) -> tuple[object, ...]:
     """Hashable layout of ``tensors`` for the validated-call caches of the small operators:
     type, dtype, device, shape, strides and contiguity (no address)."""
@@ -517,7 +531,9 @@ __all__ = [
     "has_tail",
     "normalize_situ_beta",
     "LaunchPlanCache",
+    "PEER_TABLE_BUFFERS",
     "ValidatedCalls",
+    "build_workspace_peer_tables",
     "checked_template",
     "compiled_only",
     "current_cuda_context_key",
@@ -580,7 +596,7 @@ _EXECUTING = threading.local()
 
 @contextlib.contextmanager
 def compiled_only():
-    """The execute step of a plan (``cudnn.moe_ep.cutemok.functional.forward_execute``): inside, a kernel variant that is not in
+    """The execute step of a plan (``cudnn.moe_ep._cutemok.functional.forward_execute``): inside, a kernel variant that is not in
     its process cache raises instead of being compiled or loaded.  The plan step compiles every variant its
     configuration launches, so a miss here is a call the plan was not made for -- and under a CUDA graph capture
     a compile would run in the middle of the recording.  Every ``cute.compile`` of the package goes through

@@ -11,7 +11,7 @@ expert without rows and, with ``zero_split_experts``, for every expert whose row
 boundary; every other element is untouched.  The grid has one row of CTAs per expert, striding over the
 expert's elements.  The sizes, the macrobatch size and the split switch are runtime values.
 
-The caller guarantees nonnegative int32 counts whose prefix sum fits int32.  ``cudnn.moe_ep.cutemok.functional`` does not
+The caller guarantees nonnegative int32 counts whose prefix sum fits int32.  ``cudnn.moe_ep._cutemok.functional`` does not
 call this op.
 """
 

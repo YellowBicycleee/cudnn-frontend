@@ -4,7 +4,8 @@
 # Derived from Mixture-of-Kittens (https://github.com/cursor/mixture-of-kittens, commit 22fc95ae);
 # ported to CuTe DSL and modified by NVIDIA.
 
-"""The functional interface of CuteMoK: one expert-parallel MoE layer, forward and backward.
+"""The layer CuteMoK's operator API (``cudnn.moe_ep.cutemok``) calls: one expert-parallel MoE layer, forward and backward.
+An implementation module, not part of the public API.
 
 Call order: ``get_workspace`` (the symmetric-memory buffers of one EP group and one set of shapes, cached),
 ``build_schedule`` (once per routing: all-gathers the top-k expert ids and builds this rank's padded expert
@@ -14,7 +15,7 @@ different hidden size than the shared expert.
 
 ``build_schedule``, ``forward`` and ``backward`` each run device-side barriers across the EP group
 (``barrier_all``).  Token counts, hidden sizes, the expert count and top-k are runtime values of the kernels.  The
-kernel modules (and with them CUTLASS) are imported on first use, not at ``import cudnn.moe_ep.cutemok``.
+kernel modules (and with them CUTLASS) are imported on first use, not at ``import cudnn.moe_ep._cutemok``.
 """
 
 import collections
@@ -155,7 +156,7 @@ def _device_ops(config: CuteMoKConfig):
     _validate_config_type(config)
     global _CUTEDSL_OPS
     if _CUTEDSL_OPS is None:
-        # CUTLASS and the helpers adapted from QuACK are imported on first use, not at `import cudnn.moe_ep.cutemok`.
+        # CUTLASS and the helpers adapted from QuACK are imported on first use, not at `import cudnn.moe_ep._cutemok`.
         from .cutedsl.all_gather_top_experts import all_gather_top_experts as cutedsl_all_gather
         from .cutedsl.barrier_all import barrier_all as cutedsl_barrier_all
         from .cutedsl.bwd_epilogue import bwd_epilogue_bf16
@@ -544,6 +545,10 @@ def create_workspace(
         barrier_buffer_multicast_ptr=barrier_buffer_multicast_ptr,
         barrier_target=barrier_target,
     )
+    # The megakernels' peer address tables: built here, never by a forward or backward (a graph capture).
+    from .cutedsl._host_common import build_workspace_peer_tables
+
+    build_workspace_peer_tables(workspace)
     return workspace
 
 
@@ -681,13 +686,13 @@ def clear_workspace_cache() -> None:
     # conservative synchronization of the devices they compiled for.  A module that was never
     # imported has no cache to clear.
     for module_name, clear_name in (
-        ("cudnn.moe_ep.cutemok.cutedsl.persistent_bf16_fwd", "clear_persistent_bf16_executor_cache"),
-        ("cudnn.moe_ep.cutemok.cutedsl.persistent_mxfp8_fwd", "clear_persistent_mxfp8_executor_cache"),
-        ("cudnn.moe_ep.cutemok.cutedsl.mxfp8_quantize", "clear_mxfp8_quantize_executor_cache"),
-        ("cudnn.moe_ep.cutemok.cutedsl.persistent_mxfp8_bwd", "clear_persistent_mxfp8_bwd_executor_cache"),
-        ("cudnn.moe_ep.cutemok.cutedsl.persistent_bf16_bwd", "clear_persistent_bf16_bwd_executor_cache"),
-        ("cudnn.moe_ep.cutemok.cutedsl.fwd_epilogue", "clear_fwd_epilogue_executor_cache"),
-        ("cudnn.moe_ep.cutemok.cutedsl.bwd_epilogue", "clear_bwd_epilogue_executor_cache"),
+        ("cudnn.moe_ep._cutemok.cutedsl.persistent_bf16_fwd", "clear_persistent_bf16_executor_cache"),
+        ("cudnn.moe_ep._cutemok.cutedsl.persistent_mxfp8_fwd", "clear_persistent_mxfp8_executor_cache"),
+        ("cudnn.moe_ep._cutemok.cutedsl.mxfp8_quantize", "clear_mxfp8_quantize_executor_cache"),
+        ("cudnn.moe_ep._cutemok.cutedsl.persistent_mxfp8_bwd", "clear_persistent_mxfp8_bwd_executor_cache"),
+        ("cudnn.moe_ep._cutemok.cutedsl.persistent_bf16_bwd", "clear_persistent_bf16_bwd_executor_cache"),
+        ("cudnn.moe_ep._cutemok.cutedsl.fwd_epilogue", "clear_fwd_epilogue_executor_cache"),
+        ("cudnn.moe_ep._cutemok.cutedsl.bwd_epilogue", "clear_bwd_epilogue_executor_cache"),
     ):
         persistent_bf16 = sys.modules.get(module_name)
         if persistent_bf16 is None:
@@ -882,7 +887,7 @@ def _normalize_mxfp8_backward_weights(gate, up, down):
     The backward reads Gate/Up as ``(e4m3, scale, e4m3_t, scale_t)`` and Down as
     ``(e4m3_t, scale_t)``.  A caller may append one bool saying whether the columnwise payload is
     the native ``[E, M, K]`` TransformerEngine layout rather than the transposed one
-    ``cudnn.moe_ep.cutemok.ops.mxfp8_quantize`` produces; the arguments are then a five- and a three-tuple.  The
+    ``cudnn.moe_ep._cutemok.ops.mxfp8_quantize`` produces; the arguments are then a five- and a three-tuple.  The
     dgrad reads a native payload as an MN-major operand instead of a K-major one; transposing it on
     the host would copy every routed weight every step.
 
@@ -910,7 +915,7 @@ def _normalize_mxfp8_backward_weights(gate, up, down):
 
 
 @dataclass(frozen=True)
-class SplitRoutedWeight:
+class CuteMoKSplitWeight:
     """One logical routed matrix held in independent per-expert allocations.
 
     For a caller that owns the routed experts as separate parameters instead of one grouped
@@ -918,20 +923,21 @@ class SplitRoutedWeight:
     only in base address, so CuteMoK takes one representative tensor (which carries the schema the
     validators check) plus a table of the addresses, and the kernel points its TMA descriptor at the
     right one per expert.  Routed Gate, Up and Down must all be split or none of them.
+    ``from_experts`` builds one from the per-expert tensors.
 
     ``data``: the representative expert's payload, ``[N, K]`` (BF16, or the MXFP8 e4m3 payload).
     ``storage_table``: int64 ``[num_local_experts]`` base addresses of every expert's payload
-    (``cudnn.moe_ep.cutemok.ops.make_routed_weight_storage_table_bf16`` / ``_mxfp8``).
+    (``ops.make_routed_weight_storage_table_bf16`` / ``_mxfp8``).
     ``scale`` / ``scale_storage_table`` (MXFP8): the representative expert's scale and the
-    addresses of every expert's scale (``cudnn.moe_ep.cutemok.ops.make_routed_scale_storage_table``).
+    addresses of every expert's scale (``ops.make_routed_scale_storage_table``).
 
     The tables own no storage.  The caller's parameters own every payload, so there is no parallel
     ``data_tensors`` field; the tcgen05-layout scales, by contrast, are built for CuteMoK alone, so
     ``scale_tensors`` keeps them alive for as long as the table refers to them.
 
     ``transposed_*`` carry the MXFP8 backward's columnwise operand.  ``native_columnwise`` says it
-    is TransformerEngine's own ``[E, K, N]`` payload rather than a materialized transpose, exactly
-    as in the tuple form (``_normalize_mxfp8_backward_weights``).
+    is TransformerEngine's own columnwise payload, in the weight's ``[N, K]`` order, rather than a
+    materialized ``[K, N]`` transpose, exactly as in the tuple form (``_normalize_mxfp8_backward_weights``).
 
     Gate and Up may deliberately share one ``[2I, H]`` payload, table and scale: CuteMoK then applies
     the same logical row offsets a combined FC1 gets, without repacking the parameter.
@@ -949,6 +955,73 @@ class SplitRoutedWeight:
     transposed_scale_tensors: tuple[torch.Tensor, ...] | None = None
     native_columnwise: bool = False
 
+    @classmethod
+    def from_experts(
+        cls,
+        experts,
+        scales=None,
+        transposed=None,
+        transposed_scales=None,
+        *,
+        native_columnwise: bool = False,
+    ) -> "CuteMoKSplitWeight":
+        """One routed matrix from its per-expert tensors, in local expert order; builds the address tables.
+
+        Inputs (each a list or tuple with one tensor per local expert; the tensors of one list contiguous,
+        16-byte aligned, on one CUDA device, with one dtype and shape):
+            experts:           BF16 ``[N, K]`` matrices, or MXFP8 E4M3 (float8_e4m3fn) ``[N, K]`` payloads
+            scales:            MXFP8: the payloads' scales, uint8 ``[N // 128, K // 128, 32, 16]`` (tcgen05 layout,
+                               as ``cutemok_quantize_weights`` produces them per expert); None for BF16
+            transposed:        MXFP8, for the backward: the columnwise payloads, float8_e4m3fn ``[K, N]``, or with
+                               ``native_columnwise`` TransformerEngine's columnwise payloads in the ``[N, K]`` order
+            transposed_scales: their scales, uint8 ``[K // 128, N // 128, 32, 16]`` (the scales of the ``[K, N]``
+                               matrix in either case); given with ``transposed``
+            native_columnwise: the columnwise payloads are in ``[N, K]`` order
+
+        Gate and up of one combined FC1 (``[2I, H]`` per expert) are one weight, passed as both arguments.  The
+        weight keeps the scales alive (``scale_tensors``, ``transposed_scale_tensors``) but not the payloads: the
+        caller keeps every payload allocation alive, at its address, while the weight is in use.  The tables are
+        new int64 CUDA tensors; a plan builds the TMA descriptors of new tables on their first call, so build the
+        weight once (again after the payloads move) rather than per call.
+        """
+        from . import ops
+
+        if not isinstance(experts, (list, tuple)) or not experts or not isinstance(experts[0], torch.Tensor):
+            raise TypeError("experts must be a nonempty list of tensors, one per local expert")
+        mxfp8 = experts[0].dtype == torch.float8_e4m3fn
+        if not mxfp8 and experts[0].dtype != torch.bfloat16:
+            raise TypeError(f"experts must be bfloat16 or float8_e4m3fn; got {experts[0].dtype}")
+        if mxfp8 and scales is None:
+            raise ValueError("MXFP8 experts need their scales")
+        if not mxfp8 and (scales is not None or transposed is not None or transposed_scales is not None or native_columnwise):
+            raise ValueError("BF16 experts take no scales, transposed payloads or native_columnwise")
+        if (transposed is None) != (transposed_scales is None):
+            raise ValueError("transposed and transposed_scales are given together")
+        if native_columnwise and transposed is None:
+            raise ValueError("native_columnwise describes the transposed payloads, which are not given")
+        for name, tensors in (("scales", scales), ("transposed", transposed), ("transposed_scales", transposed_scales)):
+            if tensors is not None and (not isinstance(tensors, (list, tuple)) or len(tensors) != len(experts)):
+                raise ValueError(f"{name} must be a list with one tensor per expert ({len(experts)})")
+        if not mxfp8:
+            return cls(data=experts[0], storage_table=ops.make_routed_weight_storage_table_bf16(experts))
+        fields = dict(
+            data=experts[0],
+            storage_table=ops.make_routed_weight_storage_table_mxfp8(experts),
+            scale=scales[0],
+            scale_storage_table=ops.make_routed_scale_storage_table(scales),
+            scale_tensors=tuple(scales),
+        )
+        if transposed is not None:
+            fields.update(
+                transposed_data=transposed[0],
+                transposed_scale=transposed_scales[0],
+                transposed_storage_table=ops.make_routed_weight_storage_table_mxfp8(transposed),
+                transposed_scale_storage_table=ops.make_routed_scale_storage_table(transposed_scales),
+                transposed_scale_tensors=tuple(transposed_scales),
+                native_columnwise=native_columnwise,
+            )
+        return cls(**fields)
+
 
 #: The routed weights' per-expert address tables, or None when none of them is split.  ``scales``
 #: and ``transposed`` are each a Gate/Up/Down triple or None; an MXFP8 weight is a payload *and* a
@@ -959,11 +1032,11 @@ RoutedStorageTables = collections.namedtuple("RoutedStorageTables", "gate up dow
 def _routed_weight_payload(weight):
     """The plain tensor / tuple form of a routed weight argument.
 
-    A ``SplitRoutedWeight`` becomes the representative expert's payload in the same shape the
+    A ``CuteMoKSplitWeight`` becomes the representative expert's payload in the same shape the
     non-split forms use, so every validator and every shape derivation downstream is unchanged;
     what the split form adds is the address table, which travels separately.
     """
-    if not isinstance(weight, SplitRoutedWeight):
+    if not isinstance(weight, CuteMoKSplitWeight):
         return weight
     if weight.scale is None:
         return weight.data
@@ -978,12 +1051,12 @@ def _routed_storage_tables(gate, up, down):
     Splitting is all-or-nothing: the kernel keeps one descriptor per operand and retargets it per
     expert, so a mix would mean two different addressing schemes inside one GEMM.
     """
-    split = [isinstance(weight, SplitRoutedWeight) for weight in (gate, up, down)]
+    split = [isinstance(weight, CuteMoKSplitWeight) for weight in (gate, up, down)]
     if not any(split):
         return None
     if not all(split):
         raise ValueError(
-            "routed Gate, Up and Down must all be SplitRoutedWeight or none of them; got " f"{tuple(type(weight).__name__ for weight in (gate, up, down))}"
+            "routed Gate, Up and Down must all be CuteMoKSplitWeight or none of them; got " f"{tuple(type(weight).__name__ for weight in (gate, up, down))}"
         )
 
     def group(attribute):
@@ -1066,7 +1139,7 @@ def forward(
     All three shared weights may be None for routed-only execution: no shared tasks or buffers
     run, the output is the routed sum alone and the context's shared fields are None.
 
-    The routed weights may also be ``SplitRoutedWeight`` (per-expert allocations; all three or none).
+    The routed weights may also be ``CuteMoKSplitWeight`` (per-expert allocations; all three or none).
     Passing one object as both ``routed_gate_weights`` and ``routed_up_weights`` means a combined FC1
     of ``2 * intermediate_size`` rows, Gate first.
 
@@ -1216,7 +1289,7 @@ def _forward(
         from .cutedsl.persistent_mxfp8_fwd import forward_mxfp8
 
         if storage_tables is not None and storage_tables.scales is None:
-            raise ValueError("split MXFP8 routed weights need their scales' per-expert addresses too " "(SplitRoutedWeight.scale_storage_table)")
+            raise ValueError("split MXFP8 routed weights need their scales' per-expert addresses too " "(CuteMoKSplitWeight.scale_storage_table)")
         mxfp8_outputs = forward_mxfp8(
             workspace,
             schedule,
@@ -1329,8 +1402,8 @@ def recompute_forward_context(
     x: torch.Tensor,
     shared_gate_weights: torch.Tensor | None,
     shared_up_weights: torch.Tensor | None,
-    routed_gate_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
-    routed_up_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
+    routed_gate_weights: torch.Tensor | tuple[torch.Tensor, ...] | CuteMoKSplitWeight,
+    routed_up_weights: torch.Tensor | tuple[torch.Tensor, ...] | CuteMoKSplitWeight,
     swiglu_limit: float | None = None,
     *,
     situ_beta: tuple[float, float] | None = None,
@@ -1693,11 +1766,11 @@ def backward(
         shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
         shared_down_weights: bfloat16 [hidden_size, intermediate_size]
         routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size], or the MXFP8 tuple
-                             (e4m3, scale, e4m3_t, scale_t), or SplitRoutedWeight
+                             (e4m3, scale, e4m3_t, scale_t), or CuteMoKSplitWeight
         routed_up_weights:   the same forms as routed_gate_weights (passing the same object means a
                              combined FC1, as in ``forward``)
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size], or the MXFP8 tuple
-                             (e4m3_t, scale_t), or SplitRoutedWeight.  An MXFP8 tuple may end with one bool:
+                             (e4m3_t, scale_t), or CuteMoKSplitWeight.  An MXFP8 tuple may end with one bool:
                              the columnwise payload is the native TransformerEngine layout
         swiglu_limit:        float | None
         main_grads:          six accumulation buffers ordered MAIN_GRAD_NAMES (shared, routed per
@@ -1708,7 +1781,7 @@ def backward(
                              gate and the up slot.
         main_grad_storage_tables:
                              the routed Gate, Up and Down main_grads' per-expert address tables
-                             (``cudnn.moe_ep.cutemok.ops.make_routed_d_weight_storage_table``) when they are
+                             (``cudnn.moe_ep._cutemok.ops.make_routed_d_weight_storage_table``) when they are
                              per-expert allocations: required with split routed weights, which also
                              require main_grads; a combined FC1 passes one table under both Gate and Up.
                              (routed_*_weights and their gradients use routed_hidden_size instead of hidden_size
@@ -1879,10 +1952,10 @@ def _backward(
             if getattr(storage_tables, name) is None:
                 raise ValueError(
                     "split MXFP8 routed weights need per-expert addresses for the columnwise "
-                    "payloads and for both sets of scales (SplitRoutedWeight's transposed_* and "
+                    "payloads and for both sets of scales (CuteMoKSplitWeight's transposed_* and "
                     "scale_* tables)"
                 )
-        # A SplitRoutedWeight carries both payloads, but the backward's Down operand is the
+        # A CuteMoKSplitWeight carries both payloads, but the backward's Down operand is the
         # columnwise one alone -- the same (e4m3_t, scale_t, native) triple the tuple form passes.
         routed_down_weights = routed_down_weights[2:]
 
@@ -2131,19 +2204,21 @@ def _backward(
 # Plan / execute entries (transitional names, all in this section)
 #
 # make_plan compiles every kernel a layer configuration launches and allocates what a call would
-# otherwise allocate; schedule_execute / forward_execute / backward_execute then run build_schedule /
-# forward / backward into the caller's buffers: they compile nothing and allocate no device memory.
-# They are the same code as the public functions (_build_schedule, _forward, _backward); only the
-# owner of the buffers differs.  BF16 or MXFP8 routed weights (one per plan).
+# otherwise allocate, its workspace included; schedule_execute / forward_execute / backward_execute then
+# run build_schedule / forward / backward into the caller's buffers: they compile nothing and allocate no
+# device memory.  They are the same code as the layer functions (_build_schedule, _forward, _backward); only
+# the owner of the buffers differs.  BF16 or MXFP8 routed weights (one per plan).
 # ---------------------------------------------------------------------------------------------
 @dataclass(slots=True)
 class CuteMoKPlan:
     """What ``make_plan`` prepared for one layer configuration.
 
-    The plan owns the megakernels' counters, the backward's scratch and the scheduler's scratch, and refers to
-    the workspace of ``max_tokens_per_rank`` (the symmetric buffers, shared by every plan of the same EP group
-    and shapes, as with ``get_workspace``).  The compiled kernels stay in the process caches of their modules.
-    Calls on one plan must not overlap: they share its buffers, in stream order.
+    The plan owns the megakernels' counters, the backward's scratch, the scheduler's scratch and the workspace
+    of ``max_tokens_per_rank`` (the symmetric buffers, from ``create_workspace``: not in ``get_workspace``'s
+    cache, so the plan holds the only reference and dropping it frees them).  The compiled kernels stay in the
+    process caches of their modules.  Calls on one plan must not overlap: they share its buffers, in stream
+    order.  Drop a plan only after every call and graph replay on it has finished on every rank of its group
+    (other ranks write into its symmetric buffers), outside graph capture.
     """
 
     workspace: CuteMoKWorkspace  # the buffers, sized for max_tokens_per_rank
@@ -2162,6 +2237,7 @@ class CuteMoKPlan:
     # router weights / partials; MXFP8: its int32 counters
     route_mask: torch.Tensor | None  # bool [max_tokens_per_rank, topk]: the unrouted slots of d_router_weights
     _views: dict  # num_local_tokens -> that token count's view of the workspace
+    _shapes: dict  # (step, ...) -> _schedule_shapes / _forward_shapes, computed once
 
     def workspace_for(self, num_local_tokens: int) -> CuteMoKWorkspace:
         """The workspace of calls with ``num_local_tokens`` tokens per rank (at most the plan's maximum; the
@@ -2199,14 +2275,20 @@ class CuteMoKPlan:
             )
         return view
 
-    def schedule_shapes(self, num_local_tokens: int) -> tuple[tuple[int], ...]:
+    def _schedule_shapes(self, num_local_tokens: int) -> tuple[tuple[int], ...]:
         """The shapes of ``schedule_execute``'s three int32 ``out`` buffers: peer_rank, peer_token_idx, counts."""
         from .cutedsl.scheduler import schedule_buffer_lengths
 
-        workspace = self.workspace_for(num_local_tokens)
-        return tuple((length,) for length in schedule_buffer_lengths(self.num_local_experts, workspace.ep_size, workspace.schedule_capacity)[:3])
+        key = ("schedule", num_local_tokens)
+        shapes = self._shapes.get(key)
+        if shapes is None:
+            workspace = self.workspace_for(num_local_tokens)
+            shapes = self._shapes[key] = tuple(
+                (length,) for length in schedule_buffer_lengths(self.num_local_experts, workspace.ep_size, workspace.schedule_capacity)[:3]
+            )
+        return shapes
 
-    def forward_shapes(self, config: CuteMoKConfig, num_local_tokens: int) -> tuple[tuple, tuple[int, int]]:
+    def _forward_shapes(self, config: CuteMoKConfig, num_local_tokens: int) -> tuple[tuple, tuple[int, int]]:
         """The shapes of ``forward_execute``'s buffers: ``(context_out shapes, out shape)``; ``out`` is BF16.
 
         BF16 routed weights: nine BF16 context shapes in the megakernel's output order (x_routed, gate_shared,
@@ -2217,6 +2299,10 @@ class CuteMoKPlan:
         hidden_routed_sc_t, y_shared, y_routed) and eleven with ``"bf16"`` (one BF16 gate_routed / up_routed
         each, no scales); e4m3, uint8 scale tiles or BF16.  None where a routed-only layer has no shared
         output."""
+        key = ("forward", config, num_local_tokens)
+        result = self._shapes.get(key)
+        if result is not None:
+            return result
         from .cutedsl.persistent_bf16_fwd import SHARED_OUTPUT_INDICES, PersistentBf16Plan, persistent_bf16_output_shapes
 
         workspace = self.workspace
@@ -2233,27 +2319,30 @@ class CuteMoKPlan:
                 gate_up_context=config.gate_up_context,
                 has_shared=self.has_shared,
             )
-            return outputs, (num_local_tokens, workspace.routed_hidden_size)
-        shapes = persistent_bf16_output_shapes(
-            num_local_tokens,
-            plan=PersistentBf16Plan(
-                ep_size=workspace.ep_size,
-                num_local_experts=self.num_local_experts,
-                hidden_size=workspace.hidden_size,
-                routed_hidden_size=workspace.routed_hidden_size,
-                intermediate_size=self.intermediate_size,
-                topk=workspace.topk,
-                macrobatch_size=config.macrobatch_size,
-                minibatch_size=_fwd_minibatch_size(config),
-                num_comm_sms=config.fwd_num_comm_sms,
-                has_shared=self.has_shared,
-            ),
-        )
-        if not self.has_shared:
-            shapes = tuple(None if index in SHARED_OUTPUT_INDICES else shape for index, shape in enumerate(shapes))
-        return shapes, (num_local_tokens, workspace.routed_hidden_size)
+            result = outputs, (num_local_tokens, workspace.routed_hidden_size)
+        else:
+            shapes = persistent_bf16_output_shapes(
+                num_local_tokens,
+                plan=PersistentBf16Plan(
+                    ep_size=workspace.ep_size,
+                    num_local_experts=self.num_local_experts,
+                    hidden_size=workspace.hidden_size,
+                    routed_hidden_size=workspace.routed_hidden_size,
+                    intermediate_size=self.intermediate_size,
+                    topk=workspace.topk,
+                    macrobatch_size=config.macrobatch_size,
+                    minibatch_size=_fwd_minibatch_size(config),
+                    num_comm_sms=config.fwd_num_comm_sms,
+                    has_shared=self.has_shared,
+                ),
+            )
+            if not self.has_shared:
+                shapes = tuple(None if index in SHARED_OUTPUT_INDICES else shape for index, shape in enumerate(shapes))
+            result = shapes, (num_local_tokens, workspace.routed_hidden_size)
+        self._shapes[key] = result
+        return result
 
-    def backward_shapes(self, num_local_tokens: int) -> tuple[object, tuple[int, int], tuple]:
+    def _backward_shapes(self, num_local_tokens: int) -> tuple[object, tuple[int, int], tuple]:
         """The shapes of ``backward_execute``'s buffers: ``(out, d_router_weights_out, d_weights_out)``.
         ``out`` is BF16 [num_local_tokens, hidden_size], or the pair (d_x_shared [.., hidden_size],
         d_routed_input [.., routed_hidden_size]) when the hiddens differ; d_router_weights_out is float32;
@@ -2265,6 +2354,18 @@ class CuteMoKPlan:
         out = (num_local_tokens, h) if h == r else ((num_local_tokens, h), (num_local_tokens, r))
         shared = ((i, h), (i, h), (h, i)) if self.has_shared else (None, None, None)
         return out, (num_local_tokens, workspace.topk), (shared[0], (e, i, r), shared[1], (e, i, r), shared[2], (e, r, i))
+
+
+def _empty_buffers(shapes, dtype: torch.dtype, device: torch.device):
+    """``torch.empty`` buffers of a plan's ``_*_shapes``: a shape, a (shape, dtype) pair (the MXFP8 context, of
+    that dtype), None, or a tuple of them (the same structure, of tensors)."""
+    if shapes is None:
+        return None
+    if isinstance(shapes[0], int):
+        return torch.empty(shapes, dtype=dtype, device=device)
+    if isinstance(shapes[1], torch.dtype):
+        return torch.empty(shapes[0], dtype=shapes[1], device=device)
+    return tuple(_empty_buffers(item, dtype, device) for item in shapes)
 
 
 #: The earlier name, kept as an alias.
@@ -2303,11 +2404,11 @@ def make_plan(
     staging copies and the backward's metadata builder; the MXFP8 backward's tensormap prologue is part of its
     megakernel's compiled call.
 
-    Allocated: the workspace (symmetric buffers for ``max_tokens_per_rank`` and the schedule capacity
-    ``config.schedule_capacity_multiplier`` gives, peer address tables), the forward's counters (MXFP8: and its
-    scratch, for ``config.macrobatch_size``), the scheduler's scratch and, with ``backward``, its scratch
-    (token- and macrobatch-sized, for ``config.macrobatch_size``), its counter / metadata / router-weight storage
-    and the route mask.
+    Allocated: the plan's own workspace (``create_workspace``, not cached: symmetric buffers for
+    ``max_tokens_per_rank`` and the schedule capacity ``config.schedule_capacity_multiplier`` gives, peer address
+    tables), the forward's counters (MXFP8: and its scratch, for ``config.macrobatch_size``), the scheduler's
+    scratch and, with ``backward``, its scratch (token- and macrobatch-sized, for ``config.macrobatch_size``), its
+    counter / metadata / router-weight storage and the route mask.
 
     Token counts, routed rows, macrobatch / minibatch sizes and the communication SMs are not part of the plan:
     they are runtime values of every execute call (a backward's macrobatch, and an MXFP8 forward's, at most the
@@ -2323,15 +2424,15 @@ def make_plan(
         swiglu_clamped:       whether calls pass a ``swiglu_limit``
         situ:                 whether calls pass ``situ_beta``
         has_shared:           False for a routed-only layer
-        split_routed_weights: whether the routed weights are ``SplitRoutedWeight``
+        split_routed_weights: whether the routed weights are ``CuteMoKSplitWeight``
         shared_output_gate:   whether forward calls pass a shared output gate
         backward:             False for a plan that only runs the schedule and the forward
         main_grad_dtype:      the dtype of the ``main_grads`` backward calls accumulate into (float32 or
                               bfloat16), or None when they store into ``d_weights_out``
         routed_precision:     ``"bf16"``, or ``"mxfp8"`` for MXFP8 routed weights (data / scale tuples or
-                              ``SplitRoutedWeight`` with scales)
+                              ``CuteMoKSplitWeight`` with scales)
         native_columnwise:    MXFP8: the backward's transposed routed payloads are TransformerEngine's
-                              columnwise data (``SplitRoutedWeight.native_columnwise``, or the tuples' flag)
+                              columnwise data (``CuteMoKSplitWeight.native_columnwise``, or the tuples' flag)
     """
     from .cutedsl.all_gather_top_experts import compile_all_gather_top_experts
     from .cutedsl.barrier_all import compile_barrier_all
@@ -2340,7 +2441,8 @@ def make_plan(
     from .cutedsl.persistent_bf16_fwd import compile_forward_bf16, forward_bf16_counter_words
     from .cutedsl.scheduler import compile_scheduler, schedule_buffer_lengths
 
-    workspace = get_workspace(
+    # The plan's own workspace: not in get_workspace's cache, so dropping the plan frees it.
+    workspace = create_workspace(
         config, group, device=device, num_local_tokens=max_tokens_per_rank, hidden_size=hidden_size, topk=topk, routed_hidden_size=routed_hidden_size
     )
     device = workspace.device
@@ -2509,6 +2611,7 @@ def make_plan(
         backward_storage=backward_storage,
         route_mask=route_mask,
         _views={},
+        _shapes={},
     )
 
 
@@ -2516,7 +2619,7 @@ def _plan_workspace(plan, tensor, name: str, routed_weight=None) -> CuteMoKWorks
     if not isinstance(plan, CuteMoKPlan):
         raise TypeError("plan must be a CuteMoKPlan")
     if routed_weight is not None:
-        mxfp8 = isinstance(routed_weight, tuple) or (isinstance(routed_weight, SplitRoutedWeight) and routed_weight.scale is not None)
+        mxfp8 = isinstance(routed_weight, tuple) or (isinstance(routed_weight, CuteMoKSplitWeight) and routed_weight.scale is not None)
         if mxfp8 != (plan.routed_precision == "mxfp8"):
             raise ValueError(f"the plan was made for {plan.routed_precision} routed weights " "(make_plan's routed_precision)")
     if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2:
@@ -2534,7 +2637,7 @@ def schedule_execute(
     Inputs:
         top_experts: int32 [num_local_tokens, topk] (any token count up to the plan's maximum, the same on
                      every rank); -1 marks an unused route slot.  The schedule keeps a reference to it.
-        out:         three int32 buffers of ``plan.schedule_shapes(num_local_tokens)``, 16-byte aligned:
+        out:         three int32 buffers of ``plan._schedule_shapes(num_local_tokens)``, 16-byte aligned:
                      peer_rank, peer_token_idx and the counts (num_tokens and the per-expert rows are views
                      of it).  They are the returned schedule and must stay untouched until the layer's backward.
     """
@@ -2554,9 +2657,9 @@ def forward_execute(
     shared_gate_weights: torch.Tensor | None,
     shared_up_weights: torch.Tensor | None,
     shared_down_weights: torch.Tensor | None,
-    routed_gate_weights: torch.Tensor | SplitRoutedWeight,
-    routed_up_weights: torch.Tensor | SplitRoutedWeight,
-    routed_down_weights: torch.Tensor | SplitRoutedWeight,
+    routed_gate_weights: torch.Tensor | CuteMoKSplitWeight,
+    routed_up_weights: torch.Tensor | CuteMoKSplitWeight,
+    routed_down_weights: torch.Tensor | CuteMoKSplitWeight,
     swiglu_limit: float | None = None,
     routed_input: torch.Tensor | None = None,
     *,
@@ -2569,7 +2672,7 @@ def forward_execute(
     did not compile raises) and allocating no device memory.
 
     Two things happen once rather than per call: the first call over new weight tensors checks them and builds
-    the host-side launch arguments; the first call over new ``SplitRoutedWeight`` address tables allocates and
+    the host-side launch arguments; the first call over new ``CuteMoKSplitWeight`` address tables allocates and
     builds their TMA descriptors (one builder launch per routed operand, once per set of tables, as in
     ``forward``).
 
@@ -2581,7 +2684,7 @@ def forward_execute(
     The inputs are ``forward``'s, with ``x`` of any token count up to the plan's maximum (the same on every
     rank) and ``schedule`` from ``schedule_execute`` (or ``build_schedule(plan.workspace_for(tokens), ...)``), and:
 
-        context_out:        the megakernel outputs' buffers (``plan.forward_shapes``): nine BF16, or with
+        context_out:        the megakernel outputs' buffers (``plan._forward_shapes``): nine BF16, or with
                             MXFP8 weights thirteen / eleven (``config.gate_up_context``) of their dtypes;
                             contiguous, 16-byte aligned; they become the returned context's tensors and must
                             stay untouched until its backward (MXFP8: a macrobatch at most the plan config's)
@@ -2629,9 +2732,9 @@ def backward_execute(
     shared_gate_weights: torch.Tensor | None,
     shared_up_weights: torch.Tensor | None,
     shared_down_weights: torch.Tensor | None,
-    routed_gate_weights: torch.Tensor | SplitRoutedWeight,
-    routed_up_weights: torch.Tensor | SplitRoutedWeight,
-    routed_down_weights: torch.Tensor | SplitRoutedWeight,
+    routed_gate_weights: torch.Tensor | CuteMoKSplitWeight,
+    routed_up_weights: torch.Tensor | CuteMoKSplitWeight,
+    routed_down_weights: torch.Tensor | CuteMoKSplitWeight,
     swiglu_limit: float | None = None,
     main_grads: tuple | None = None,
     main_grad_storage_tables: tuple | None = None,
@@ -2648,7 +2751,7 @@ def backward_execute(
 
     Once rather than per call, as in ``forward_execute``: the host-side launch arguments of new weight tensors
     or of a new geometry (token count, macrobatch / minibatch size, communication SMs), carved out of the
-    plan's storage; the TMA descriptors of new ``SplitRoutedWeight`` / main_grad address tables.
+    plan's storage; the TMA descriptors of new ``CuteMoKSplitWeight`` / main_grad address tables.
 
     Per call it launches, in order: the staging copy of the routed rows of ``grad_output`` and ``x`` and of the
     router weights (BF16: one kernel when both are 256-byte aligned and the hiddens coincide; otherwise, and
@@ -2661,7 +2764,7 @@ def backward_execute(
     The inputs are ``backward``'s -- a forward context with its routed activations, a macrobatch at most the
     plan config's, no shared output gate -- and:
 
-        out:                  the input gradient's buffer(s) (``plan.backward_shapes``): BF16
+        out:                  the input gradient's buffer(s) (``plan._backward_shapes``): BF16
                               [num_local_tokens, hidden_size], or (d_x_shared, d_routed_input) when the
                               hiddens differ
         d_router_weights_out: float32 [num_local_tokens, topk]

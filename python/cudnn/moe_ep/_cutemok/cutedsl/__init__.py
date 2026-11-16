@@ -9,6 +9,6 @@
 ``persistent_mxfp8_bwd``), their epilogues, and the scheduling and communication operators.
 
 The kernels require CuTe DSL >= 4.8.0 (its cu13 build), checked on first use (``_version_gate``); the few
-QuACK 0.5.0 helpers they build on are adapted in ``_compat``.  ``cudnn.moe_ep.cutemok.functional`` and ``cudnn.moe_ep.cutemok.ops`` import
+QuACK 0.5.0 helpers they build on are adapted in ``_compat``.  ``cudnn.moe_ep._cutemok.functional`` and ``cudnn.moe_ep._cutemok.ops`` import
 the kernel modules on first use; importing this package imports none of them.
 """
