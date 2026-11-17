@@ -2484,7 +2484,7 @@ def make_plan(
 
     forward_scratch = None
     if mxfp8:
-        from .cutedsl.persistent_mxfp8_fwd import compile_forward_mxfp8, forward_mxfp8_buffer_specs, forward_mxfp8_counter_words
+        from .cutedsl.persistent_mxfp8_fwd import forward_mxfp8_buffer_specs, forward_mxfp8_counter_words
 
         sizes = dict(hidden_size=hidden_size, routed_hidden_size=workspace.routed_hidden_size, intermediate_size=intermediate_size, topk=topk)
         forward_counters = words(forward_mxfp8_counter_words(max_tokens_per_rank, workspace.schedule_capacity, **sizes))
@@ -2511,6 +2511,8 @@ def make_plan(
     compile_scheduler(workspace.all_gather_top_experts_buffer, schedule_scratch)
     compile_barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs, workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
     if mxfp8:
+        from .cutedsl.persistent_mxfp8_fwd import compile_forward_mxfp8
+
         compile_forward_mxfp8(
             workspace,
             num_local_experts=num_local_experts,
