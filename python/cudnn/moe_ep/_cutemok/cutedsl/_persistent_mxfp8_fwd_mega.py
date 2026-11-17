@@ -387,8 +387,26 @@ def _quantize_transposed_warp(
 
 
 @cute.jit
+def _normal_row_store_offset(row: Int32, hb: Int32, column0: Int32, row_units: Uint32) -> Int64:
+    """Byte offset of row ``row`` (0-31 of a 32-row tile), half block ``hb`` of the subtile at column ``column0``,
+    from the tile's first row: ``row x hidden + column0 + 16 hb`` for rows of ``row_units`` x 16 B (``hidden / 16``).
+    The sum is formed in 16-byte units in 32 bits and widened; it is below 32 x hidden / 16 < 2^32 for every hidden
+    the plan accepts (below 2^31), unsigned so it does not wrap."""
+    return Int64(Uint32(row) * row_units + Uint32((column0 >> Int32(4)) + hb)) << Int64(4)
+
+
+@cute.jit
 def _quantize_normal_warp(
-    source: cute.Pointer, lane: Int32, row_stride_bytes: cutlass.Constexpr[int], out_row0: Int64, out_row_stride: Int64, scale0: Int64, unit: Int32
+    source: cute.Pointer,
+    lane: Int32,
+    row_stride_bytes: cutlass.Constexpr[int],
+    out_row0: Int64,
+    out_row_stride: Int64,
+    scale0: Int64,
+    unit: Int32,
+    column0: Int32,
+    row_units: Uint32,
+    lane_terms_in_32bit: cutlass.Constexpr[bool],
 ) -> None:
     """The normal pass of a 32-row x 128-column BF16 subtile in shared memory by one warp, half blocks per lane.
     Lane ``l`` takes half block ``hb = l % 8`` (columns ``16 hb`` .. ``16 hb + 15``, block ``hb / 2``) of rows
@@ -397,7 +415,15 @@ def _quantize_normal_warp(
     row stride.  The block amax pairs lanes ``l`` and ``l ^ 1`` (one butterfly); the 16 e4m3 bytes go out by one
     16 B store (the eight lanes of a row write its 128 B), the scale byte by the even lane, at ``scale0 + 16 (s %
     32) + 4 (s / 32) + block`` with ``s = 32 unit + row`` (``unit``: the 32-row tile within the 128-row scale
-    tile)."""
+    tile).
+
+    The e4m3 store address: with ``lane_terms_in_32bit``, ``out_row0`` is the 32-row tile's first row and the lane's
+    row and half-block terms are added to the subtile's column ``column0`` in 32 bits (``_normal_row_store_offset``,
+    16-byte units, ``row_units`` = hidden / 16) before widening; otherwise ``out_row0`` also holds the subtile's
+    column and the address is ``out_row0 + row x out_row_stride + 16 hb`` (``column0`` / ``row_units`` unused).
+    Written the second way, the lane's eight 64-bit row offsets are the same for every block a warp quantizes, and
+    CuTe DSL 4.8 computes them once at kernel scope and keeps 16 registers across the stream loop (4.5.2 forms the
+    eight 64-bit addresses at the top of every block and keeps them until the stores)."""
     hb = lane & Int32(7)
     swap = (lane >> Int32(2)) & Int32(1)
     block = hb >> Int32(1)
@@ -418,7 +444,10 @@ def _quantize_normal_warp(
         amax = _amax_float(_abs_max_xorsign_bf16x2(amaxes[i], partners[i]))
         scale_byte, e = _encode_words(first[i] + second[i], amax)
         out_words = [e[k] ^ ((e[k] ^ e[k ^ 2]) & sel) for k in range(4)]
-        _store_global_v4(out_row0 + Int64(rows[i]) * out_row_stride + Int64(hb * Int32(16)), out_words)
+        if cutlass.const_expr(lane_terms_in_32bit):
+            _store_global_v4(out_row0 + _normal_row_store_offset(rows[i], hb, column0, row_units), out_words)
+        else:
+            _store_global_v4(out_row0 + Int64(rows[i]) * out_row_stride + Int64(hb * Int32(16)), out_words)
         if (hb & Int32(1)) == Int32(0):
             scale_row = (unit << Int32(5)) + rows[i]
             _store_global_u8(scale0 + Int64((scale_row & Int32(31)) * Int32(16) + (scale_row >> Int32(5)) * Int32(4) + block), scale_byte)
@@ -615,11 +644,11 @@ class _PersistentMxfp8FwdMega(_Mxfp8FwdBase):
     compile time: each combination is its own compiled kernel.
     """
 
-    # How ``_stream_quantize`` forms the transposed pass's store addresses (compile time, per kernel class).  True:
-    # the lane's column term is added to the pulled block's term in 32 bits and the sum widened (see
-    # ``_quantize_transposed_warp``); the forward is faster with it.  False: the block's term goes into the 64-bit
-    # base and the lane's term is widened on its own; the backward megakernel, which runs the same stream code, is
-    # faster with that and sets False.
+    # How ``_stream_quantize`` forms the store addresses of both passes (compile time, per kernel class).  True: the
+    # lane's terms are added to a term of the pulled block in 32 bits and the sum widened (see
+    # ``_quantize_transposed_warp`` and ``_quantize_normal_warp``); the forward's transposed pass is faster with it
+    # under CuTe DSL 4.5.2 and 4.8.  False: the block's terms go into the 64-bit bases and the lane's terms are widened
+    # on their own; the backward megakernel, which runs the same stream code, is faster with that and sets False.
     stream_lane_terms_in_32bit = True
 
     def __init__(
@@ -739,16 +768,21 @@ class _PersistentMxfp8FwdMega(_Mxfp8FwdBase):
                 out_t_base = x_t_base + Int64(row_unit * Int32(STREAM_ROWS))
                 column0 = column_block * Int32(QUANT_TILE)
                 unit_t = unit
+                out_row0 = x_routed_base + Int64(row_unit * Int32(STREAM_ROWS)) * Int64(hidden_size)
+                row_units = Uint32(hidden_size >> Int32(4))
             else:  # the block's terms in the 64-bit bases; the constant zeros leave the lane's terms on their own
                 out_t_base = x_t_base + Int64(column_block * Int32(QUANT_TILE)) * Int64(macrobatch_size) + Int64(row_unit * Int32(STREAM_ROWS))
                 scale_t_base = scale_t_base + Int64(unit)
                 column0 = Int32(0)
                 unit_t = Int32(0)
-            out_row0 = x_routed_base + Int64(row_unit * Int32(STREAM_ROWS)) * Int64(hidden_size) + Int64(column_block * Int32(QUANT_TILE))
+                out_row0 = x_routed_base + Int64(row_unit * Int32(STREAM_ROWS)) * Int64(hidden_size) + Int64(column_block * Int32(QUANT_TILE))
+                row_units = Uint32(0)
             scale0 = x_sc_base + (Int64(row_tile) * Int64(scale_columns) + Int64(column_block)) * Int64(QUANT_SF_TILE_BYTES)
             for h in cutlass.range_constexpr(2):
                 _quantize_transposed_warp(source, Int32(32 * h) + lane, STREAM_COLUMNS * 2, out_t_base, column0, Int64(macrobatch_size), scale_t_base, unit_t)
-            _quantize_normal_warp(source, lane, STREAM_COLUMNS * 2, out_row0, Int64(hidden_size), scale0, unit)
+            _quantize_normal_warp(
+                source, lane, STREAM_COLUMNS * 2, out_row0, Int64(hidden_size), scale0, unit, column0, row_units, self.stream_lane_terms_in_32bit
+            )
 
     @cute.jit
     def _stream_decode(self, operands: list, task: Int32) -> tuple[Int32, Int32, Int32]:

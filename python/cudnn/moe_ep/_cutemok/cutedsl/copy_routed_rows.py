@@ -9,12 +9,15 @@
 Copies the rows of each source that have at least one routed slot (top_experts >= 0) into the
 matching buffer and leaves the other rows untouched (peers read only routed rows, through the
 buffer pointers; the shared expert reads the caller's tensors), and copies the full router weights.
+The backward's variant also writes zero into the unused slots (top_experts < 0) of its router-weight
+gradient buffer: the peers write only used slots of that buffer in the call that follows.
 
 One warp per (token, 1024-column segment): the warp votes whether the token has a route, lane
 ``l`` moves the 16-byte vectors at columns ``segment * 1024 + v * 256 + 8 * l`` (v = 0..3) of each
 of the one or two source / destination pairs, and the token's first segment also copies its
-``topk`` router weights.  Token count, hidden size and top-k are runtime values; the number of
-pairs and the presence of router weights are compile time.  Sources and destinations are 16-byte
+``topk`` router weights (and zeroes the unused gradient slots).  Token count, hidden size and top-k
+are runtime values; the number of pairs and the presence of router weights and of the gradient buffer
+are compile time.  Sources and destinations are 16-byte
 aligned contiguous BF16 ``[T, H]`` with ``H % 8 == 0``.
 """
 
@@ -28,7 +31,7 @@ VEC = 8  # BF16 elements per 16-byte access
 VECS_PER_LANE = 4
 SEGMENT = 32 * VEC * VECS_PER_LANE  # 1024 columns per warp task
 MAX_PAIRS = 2
-_CODEGEN_EPOCH = "copy-routed-rows-bf16-v1"
+_CODEGEN_EPOCH = "copy-routed-rows-bf16-v2"
 
 from ._version_gate import require_cutedsl
 
@@ -38,7 +41,7 @@ import torch
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64
 from cutlass.cute.runtime import from_dlpack
 
 from ._host_common import current_cuda_context_key as _current_cuda_context_key
@@ -67,9 +70,10 @@ def _vector(tensor: cute.Tensor, token: Int32, hidden: Int32, column: Int32):
 
 
 class _CopyRoutedRows:
-    def __init__(self, num_pairs: int, has_weights: bool):
+    def __init__(self, num_pairs: int, has_weights: bool, zeroes_unrouted: bool = False):
         self.num_pairs = num_pairs
         self.has_weights = has_weights
+        self.zeroes_unrouted = zeroes_unrouted
 
     @cute.jit
     def __call__(
@@ -81,13 +85,14 @@ class _CopyRoutedRows:
         dst1: cute.Tensor,
         weights: cute.Tensor,
         weights_dst: cute.Tensor,
+        unrouted_dst: cute.Tensor,
         num_tokens: Int32,
         hidden: Int32,
         topk: Int32,
         blocks: Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(top_experts, src0, dst0, src1, dst1, weights, weights_dst, num_tokens, hidden, topk).launch(
+        self.kernel(top_experts, src0, dst0, src1, dst1, weights, weights_dst, unrouted_dst, num_tokens, hidden, topk).launch(
             grid=(blocks, 1, 1), block=(THREADS, 1, 1), stream=stream
         )
 
@@ -101,6 +106,7 @@ class _CopyRoutedRows:
         dst1: cute.Tensor,
         weights: cute.Tensor,
         weights_dst: cute.Tensor,
+        unrouted_dst: cute.Tensor,
         num_tokens: Int32,
         hidden: Int32,
         topk: Int32,
@@ -130,6 +136,13 @@ class _CopyRoutedRows:
                     slot = lane
                     while slot < topk:
                         weights_dst[token, slot] = weights[token, slot]
+                        slot = slot + Int32(32)
+            if cutlass.const_expr(self.zeroes_unrouted):
+                if col < Int32(32 * VEC):  # the token's first segment: its unused gradient slots
+                    slot = lane
+                    while slot < topk:
+                        if top_experts[token, slot] < Int32(0):
+                            unrouted_dst[token, slot] = Float32(0.0)
                         slot = slot + Int32(32)
             if routed != Int32(0):
                 for v in cutlass.range_constexpr(VECS_PER_LANE):
@@ -162,19 +175,20 @@ def _fresh(tensor, dtype, shape, device) -> bool:
     return type(tensor) is torch.Tensor and tensor.dtype == dtype and tensor.device == device and tensor.shape == shape and tensor.is_contiguous()
 
 
-def _executor(operands, num_pairs, has_weights, num_tokens, hidden, topk, index, stream):
-    """The compiled variant (one or two pairs, with or without the router weights), compiled on first use."""
-    key = (_CODEGEN_EPOCH, num_pairs, has_weights, index, _current_cuda_context_key(), _COMPILE_OPTIONS)
+def _executor(operands, num_pairs, has_weights, zeroes_unrouted, num_tokens, hidden, topk, index, stream):
+    """The compiled variant (one or two pairs, with or without the router weights, with or without the
+    gradient buffer whose unused slots it zeroes), compiled on first use."""
+    key = (_CODEGEN_EPOCH, num_pairs, has_weights, zeroes_unrouted, index, _current_cuda_context_key(), _COMPILE_OPTIONS)
     executor = _EXECUTORS.get(key)
     if executor is None:
         with _LOCK:
             executor = _EXECUTORS.get(key)
             if executor is None:
-                aligns = (4, 16, 16, 16, 16, 4, 4)
+                aligns = (4, 16, 16, 16, 16, 4, 4, 4)
                 arguments = tuple(from_dlpack(t, assumed_align=a, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=1) for t, a in zip(operands, aligns))
-                kernel = _CopyRoutedRows(num_pairs, has_weights)
+                kernel = _CopyRoutedRows(num_pairs, has_weights, zeroes_unrouted)
                 executor = persistent_executor(
-                    ("copy_routed_rows", _CODEGEN_EPOCH, num_pairs, has_weights, _COMPILE_OPTIONS),
+                    ("copy_routed_rows", _CODEGEN_EPOCH, num_pairs, has_weights, zeroes_unrouted, _COMPILE_OPTIONS),
                     lambda: cute.compile(kernel, *arguments, Int32(num_tokens), Int32(hidden), Int32(topk), Int32(1), stream, options=_COMPILE_OPTIONS),
                 )
                 _EXECUTORS[key] = executor
@@ -183,24 +197,37 @@ def _executor(operands, num_pairs, has_weights, num_tokens, hidden, topk, index,
 
 def compile_copy_routed_rows(top_experts, destination, weights_destination, num_pairs: int = 1) -> None:
     """The plan step: compile the variant with router weights and one pair (the forward's staging copy) or two
-    (the backward's) without launching.  The arguments only give the kernel's tensor ranks and dtypes -- int32
-    [T, topk], BF16 [T, H], FP32 [T, topk] -- so the workspace buffers stand in for the caller's tensors."""
+    with the gradient slots zeroed (the backward's) without launching.  The arguments only give the kernel's
+    tensor ranks and dtypes -- int32 [T, topk], BF16 [T, H], FP32 [T, topk] -- so the workspace buffers stand in
+    for the caller's tensors."""
     index = destination.device.index
     index = _current_device_index() if index is None else index
-    operands = (top_experts, destination, destination, destination, destination, weights_destination, weights_destination)
-    _executor(operands, num_pairs, True, int(top_experts.shape[0]), int(destination.shape[1]), int(top_experts.shape[1]), index, current_stream_handle(index))
+    operands = (top_experts, destination, destination, destination, destination, weights_destination, weights_destination, weights_destination)
+    _executor(
+        operands,
+        num_pairs,
+        True,
+        num_pairs == 2,
+        int(top_experts.shape[0]),
+        int(destination.shape[1]),
+        int(top_experts.shape[1]),
+        index,
+        current_stream_handle(index),
+    )
 
 
-def copy_routed_rows(top_experts, sources, destinations, weights=None, weights_destination=None) -> None:
+def copy_routed_rows(top_experts, sources, destinations, weights=None, weights_destination=None, zero_unrouted=None) -> None:
     """Copy one or two source -> destination BF16 [T, H] pairs, rows with at least one route
-    (``top_experts[t, k] >= 0``) only; and, when given, the full FP32 [T, topk] router weights."""
+    (``top_experts[t, k] >= 0``) only; and, when given, the full FP32 [T, topk] router weights.
+    ``zero_unrouted`` (FP32 [T, topk], optional): its unused slots (``top_experts[t, k] < 0``) are set to
+    zero and its other slots are left untouched."""
     fast = None
     if type(top_experts) is torch.Tensor:
-        fast = _FAST.get((tuple(map(id, destinations)), id(weights_destination), top_experts.device))
+        fast = _FAST.get((tuple(map(id, destinations)), id(weights_destination), id(zero_unrouted), top_experts.device))
     if fast is not None:
         refs, pointers, num_tokens, hidden, topk, executor, index = fast
         device = top_experts.device
-        owned = (*destinations, weights_destination)
+        owned = (*destinations, weights_destination, zero_unrouted)
         if (
             len(owned) == len(refs)
             and all(ref() is buffer for ref, buffer in zip(refs, owned))
@@ -216,6 +243,7 @@ def copy_routed_rows(top_experts, sources, destinations, weights=None, weights_d
             dst1 = destinations[1] if num_pairs == 2 else destinations[0]
             w = weights if weights is not None else top_experts.new_zeros((1, 1), dtype=torch.float32)
             wd = weights_destination if weights is not None else w
+            zd = zero_unrouted if zero_unrouted is not None else wd
             tasks = num_tokens * ((hidden + SEGMENT - 1) // SEGMENT)
             executor(
                 top_experts,
@@ -225,6 +253,7 @@ def copy_routed_rows(top_experts, sources, destinations, weights=None, weights_d
                 dst1,
                 w,
                 wd,
+                zd,
                 num_tokens,
                 hidden,
                 topk,
@@ -252,6 +281,8 @@ def copy_routed_rows(top_experts, sources, destinations, weights=None, weights_d
     if weights is not None:
         _check(weights, "router_weights", (num_tokens, topk), torch.float32, device)
         _check(weights_destination, "router_weight_buffer", (num_tokens, topk), torch.float32, device)
+    if zero_unrouted is not None:
+        _check(zero_unrouted, "zero_unrouted", (num_tokens, topk), torch.float32, device)
     tasks = num_tokens * ((hidden + SEGMENT - 1) // SEGMENT)
     if tasks == 0:
         return
@@ -262,18 +293,20 @@ def copy_routed_rows(top_experts, sources, destinations, weights=None, weights_d
     dst1 = destinations[1] if num_pairs == 2 else destinations[0]
     w = weights if has_weights else top_experts.new_zeros((1, 1), dtype=torch.float32)
     wd = weights_destination if has_weights else w
+    zeroes_unrouted = zero_unrouted is not None
+    zd = zero_unrouted if zeroes_unrouted else wd
     index = device.index if device.index is not None else _current_device_index()
     stream = current_stream_handle(index)
-    operands = (top_experts, sources[0], destinations[0], src1, dst1, w, wd)
-    executor = _executor(operands, num_pairs, has_weights, num_tokens, hidden, topk, index, stream)
+    operands = (top_experts, sources[0], destinations[0], src1, dst1, w, wd, zd)
+    executor = _executor(operands, num_pairs, has_weights, zeroes_unrouted, num_tokens, hidden, topk, index, stream)
     blocks = (tasks + WARPS - 1) // WARPS
     executor(*operands, num_tokens, hidden, topk, blocks, stream)
     import weakref
 
     if len(_FAST) >= 64:
         _FAST.clear()
-    owned = (*destinations, weights_destination)
-    _FAST[(tuple(map(id, destinations)), id(weights_destination), device)] = (
+    owned = (*destinations, weights_destination, zero_unrouted)
+    _FAST[(tuple(map(id, destinations)), id(weights_destination), id(zero_unrouted), device)] = (
         tuple((lambda: None) if buffer is None else weakref.ref(buffer) for buffer in owned),
         tuple(None if buffer is None else buffer.data_ptr() for buffer in owned),
         num_tokens,

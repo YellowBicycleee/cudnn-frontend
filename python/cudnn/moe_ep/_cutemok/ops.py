@@ -101,13 +101,15 @@ def copy_routed_rows(
     destinations: list[torch.Tensor],
     router_weights: torch.Tensor | None = None,
     router_weight_buffer: torch.Tensor | None = None,
+    zero_unrouted: torch.Tensor | None = None,
 ) -> None:
     """Copies the rows of one or two BF16 [T, H] sources that have at least one route
     (top_experts >= 0) into their destinations, leaving the other rows untouched, and the full FP32
-    [T, topk] router weights when given."""
+    [T, topk] router weights when given.  ``zero_unrouted`` (FP32 [T, topk]): its slots with
+    top_experts < 0 are set to zero, the others left untouched."""
     from .cutedsl.copy_routed_rows import copy_routed_rows as impl
 
-    impl(top_experts, sources, destinations, router_weights, router_weight_buffer)
+    impl(top_experts, sources, destinations, router_weights, router_weight_buffer, zero_unrouted)
 
 
 def fwd_epilogue(

@@ -3868,8 +3868,8 @@ class _PersistentBf16BwdMega:
                 cute.autovec_copy(r_hidden_bf16, cute.local_tile(hidden_routed[ring_row, None], (_SWAP_FEATURE_GROUP,), (feature_group + group,)))
             # Router partial of the token over this SwiGLU tile: chunks 0 and 2 are their own sums, chunks 1
             # and 3 add the sum of the lane below (features 0..63, 64..127), chunk 3 adds half 0 (two lanes
-            # below) + half 1 and stores.  A half is (chunk sum) + (chunk sum), not one running sum over its
-            # 64 features.  Padding rows (not routed) add nothing and store 0.
+            # below) + half 1 and stores.  A half is (chunk sum) + (chunk sum), each chunk summed from zero, not
+            # one running sum over its 64 features.  Padding rows (not routed) add nothing and store 0.
             if not routed_row:
                 chunk_partial = Float32(0.0)
             router_partial = chunk_partial

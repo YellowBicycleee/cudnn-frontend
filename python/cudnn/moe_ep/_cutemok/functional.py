@@ -2033,7 +2033,16 @@ def _backward(
     if routed_rows_only:
         from .cutedsl.copy_routed_rows import copy_routed_rows
 
-        copy_routed_rows(schedule.top_experts, [grad_output, x], [workspace.d_y_buffer, workspace.x_buffer], router_weights, workspace.router_weight_buffer)
+        # The same kernel zeroes the unused slots of the router-weight gradient buffer: the peers write
+        # only this call's used slots, after the barrier below, so the buffer needs no masking afterwards.
+        copy_routed_rows(
+            schedule.top_experts,
+            [grad_output, x],
+            [workspace.d_y_buffer, workspace.x_buffer],
+            router_weights,
+            workspace.router_weight_buffer,
+            zero_unrouted=workspace.d_router_weight_buffer,
+        )
         if d_y_shared is None:
             d_y_shared = grad_output
     else:
@@ -2176,14 +2185,16 @@ def _backward(
         d_x = (d_x_shared, ops.bwd_epilogue(None, workspace.d_x_routed_buffer, schedule.top_experts, out=None if buffers is None else out[1]))
     else:
         d_x = ops.bwd_epilogue(d_x_shared, workspace.d_x_routed_buffer, schedule.top_experts, out=None if buffers is None else out)
+    # An unused route slot has no gradient: this call never wrote its buffer entry.  copy_routed_rows
+    # zeroed those entries already; the full copies of the other paths leave them to the mask.
+    mask_unrouted = zero_unrouted_router_grads and not routed_rows_only
     if buffers is None:
         d_router_weights = workspace.d_router_weight_buffer.clone()  # TODO: we can remove this
-        # An unused route slot has no gradient: its buffer entry was never written by this call.
-        if zero_unrouted_router_grads:
+        if mask_unrouted:
             d_router_weights.masked_fill_(schedule.top_experts < 0, 0.0)
     else:
         d_router_weights = d_router_weights_out.copy_(workspace.d_router_weight_buffer)
-        if zero_unrouted_router_grads:
+        if mask_unrouted:
             d_router_weights.masked_fill_(torch.lt(schedule.top_experts, 0, out=route_mask[: workspace.num_local_tokens]), 0.0)
     d_w_output_gate = None
     if gate is not None:
