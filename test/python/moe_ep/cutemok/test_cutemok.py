@@ -4,8 +4,8 @@
 # The inputs and the reference are derived from the test utilities of Mixture-of-Kittens
 # (https://github.com/cursor/mixture-of-kittens, commit 22fc95ae); modified by NVIDIA.
 
-"""CuTe MoK: forward and backward against a PyTorch reference, CUDA graph replay, the plan's ownership of its
-workspace, declines and exports.
+"""CuTe MoK: forward and backward against a PyTorch reference, the shared output gate against the layer functions,
+CUDA graph replay, the plan's ownership of its workspace, declines and exports.
 
 The GPU tests run on the ranks of the process group: one GPU under plain pytest (a one-rank NCCL group), expert
 parallel under torchrun (``torchrun --nproc-per-node=8 -m pytest test_cutemok.py``).
@@ -251,7 +251,7 @@ def test_forward_backward(group, case):
         main_grad_storage_tables=tables,
         swiglu_limit=limit,
     )
-    assert grads[8] is None
+    assert grads[8] is None  # no shared output gate
     assert isinstance(grads, TupleDict) and list(grads.keys()) == [*GRADIENT_NAMES, "d_w_output_gate"]
     grads = list(grads)[:8]
     if case == "split_weights":
@@ -271,23 +271,95 @@ def test_forward_backward(group, case):
             _check(f"{case}: {name}", expected, actual, tolerance)
 
 
+def _gate_weight(rank, device, seed):
+    """A shared output gate weight, bfloat16 [1, H] scaled by 1/sqrt(H)."""
+    generator = torch.Generator(device=device).manual_seed(seed + rank)
+    return torch.randn(1, HIDDEN, generator=generator, device=device, dtype=torch.bfloat16) * HIDDEN**-0.5
+
+
+@pytest.mark.parametrize("main_grad", [False, True])
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
-def test_cuda_graph(group, precision):
-    """Forward and backward captured once after one eager warm-up call, and replayed on new inputs written into the
-    captured tensors (routing included): every replay matches an eager call bit for bit.  The captured calls
-    allocate their results in the graph's pool."""
+def test_shared_output_gate(group, precision, main_grad):
+    """The shared output gate (prepare with ``shared_output_gate=True``; the gate weight in forward and backward)
+    gives the layer functions' results bit for bit: the output, the eight gradients and the gate weight's FP32
+    gradient, new or added into ``shared_output_gate_main_grad``.  A gated forward context needs the weight in
+    the backward."""
     rank, world_size, device = group
     config = _config()
-    plan = _prepare(config, device, routed_precision=precision)
+    plan = _prepare(config, device, shared_output_gate=True, routed_precision=precision)
+    x, top_experts, router_weights, shared, routed, d_output = _inputs(rank, world_size, device, 60)
+    weight = _gate_weight(rank, device, 61)
+    forward_routed = backward_routed = routed
+    if precision == "mxfp8":
+        forward_routed, backward_routed = cutemok_quantize_weights(*routed)
+    main_grads = [torch.full((1, HIDDEN), 0.5, dtype=torch.float32, device=device) if main_grad else None for _ in range(2)]
+
+    output, schedule, saved = cutemok_forward(
+        x, top_experts, router_weights, *shared, *forward_routed, plan=plan, config=config, shared_output_gate_weight=weight
+    )
+    with pytest.raises(ValueError, match="a gated forward context requires shared_output_gate_weight"):
+        cutemok_backward(d_output, x, router_weights, *shared, *backward_routed, schedule, saved, plan=plan, config=config)
+    grads = cutemok_backward(
+        d_output,
+        x,
+        router_weights,
+        *shared,
+        *backward_routed,
+        schedule,
+        saved,
+        plan=plan,
+        config=config,
+        shared_output_gate_weight=weight,
+        shared_output_gate_main_grad=main_grads[0],
+    )
+    assert list(grads.keys()) == [*GRADIENT_NAMES, "d_w_output_gate"]
+    if main_grad:
+        assert grads["d_w_output_gate"] is main_grads[0]
+    else:
+        assert grads["d_w_output_gate"].dtype == torch.float32 and tuple(grads["d_w_output_gate"].shape) == (1, HIDDEN)
+
+    workspace = functional.get_workspace(config, dist.group.WORLD, device=device, num_local_tokens=TOKENS, hidden_size=HIDDEN, topk=TOPK)
+    layer_schedule = functional.build_schedule(workspace, config, top_experts, num_local_experts=LOCAL_EXPERTS)
+    expected_output, layer_context = functional.forward(
+        config, workspace, layer_schedule, x, router_weights, *shared, *forward_routed, shared_output_gate_weight=weight
+    )
+    expected = functional.backward(
+        config,
+        workspace,
+        layer_schedule,
+        layer_context,
+        d_output,
+        x,
+        router_weights,
+        *shared,
+        *backward_routed,
+        shared_output_gate_weight=weight,
+        shared_output_gate_main_grad=main_grads[1],
+    )
+    for name, a, b in zip(("output", *GRADIENT_NAMES, "d_w_output_gate"), (expected_output, *expected), (output, *grads), strict=True):
+        assert torch.equal(a, b), f"{precision}{' main_grad' if main_grad else ''}: {name} differs"
+    torch.cuda.synchronize(device)
+    dist.barrier()
+
+
+@pytest.mark.parametrize("precision,gated", [("bf16", False), ("mxfp8", False), ("bf16", True)])
+def test_cuda_graph(group, precision, gated):
+    """Forward and backward captured once after one eager warm-up call, and replayed on new inputs written into the
+    captured tensors (routing included): every replay matches an eager call bit for bit.  The captured calls
+    allocate their results in the graph's pool.  ``gated``: with the shared output gate."""
+    rank, world_size, device = group
+    config = _config()
+    plan = _prepare(config, device, routed_precision=precision, shared_output_gate=gated)
     x, top_experts, router_weights, shared, routed, d_output = _inputs(rank, world_size, device, 50)
+    gate = dict(shared_output_gate_weight=_gate_weight(rank, device, 55)) if gated else {}
     forward_routed = backward_routed = routed
     if precision == "mxfp8":
         forward_routed, backward_routed = cutemok_quantize_weights(*routed)
 
     def step():
-        output, schedule, saved = cutemok_forward(x, top_experts, router_weights, *shared, *forward_routed, plan=plan, config=config)
-        grads = cutemok_backward(d_output, x, router_weights, *shared, *backward_routed, schedule, saved, plan=plan, config=config)
-        return [output, *list(grads)[:8]]
+        output, schedule, saved = cutemok_forward(x, top_experts, router_weights, *shared, *forward_routed, plan=plan, config=config, **gate)
+        grads = cutemok_backward(d_output, x, router_weights, *shared, *backward_routed, schedule, saved, plan=plan, config=config, **gate)
+        return [output, *list(grads)[: 9 if gated else 8]]
 
     step()  # warm-up
     graph = torch.cuda.CUDAGraph()
@@ -300,7 +372,7 @@ def test_cuda_graph(group, precision):
         eager = [t.clone() for t in step()]
         graph.replay()
         for index, (expected, actual) in enumerate(zip(eager, captured, strict=True)):
-            assert torch.equal(expected, actual), f"{precision}: seed {seed}, result {index} differs from eager"
+            assert torch.equal(expected, actual), f"{precision}{' gated' if gated else ''}: seed {seed}, result {index} differs from eager"
     del graph
     dist.barrier()
 
@@ -361,10 +433,10 @@ def test_plan_owns_workspace(group):
     dist.barrier()
 
 
-def _host_plan(precision):
+def _host_plan(precision, shared_output_gate=False):
     """A plan object for the declines, which are raised before a plan's buffers are touched."""
     fields = {field.name: None for field in dataclasses.fields(CuteMoKPlan)}
-    return CuteMoKPlan(**fields | {"routed_precision": precision, "_views": {}, "_shapes": {}})
+    return CuteMoKPlan(**fields | {"routed_precision": precision, "shared_output_gate": shared_output_gate, "_views": {}, "_shapes": {}})
 
 
 def test_declines():
@@ -392,6 +464,14 @@ def test_declines():
         forward(plan=object())
     with pytest.raises(NotImplementedError, match="grad_output"):
         cutemok_backward(x.float(), x, router_weights, None, None, None, *routed, None, None, **buffers)
+    # The shared output gate: the weight is given exactly when the plan was prepared with it.
+    weight = torch.zeros(1, 256, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="pass shared_output_gate_weight"):
+        forward(plan=_host_plan("bf16", shared_output_gate=True))
+    with pytest.raises(ValueError, match="prepared without the shared output gate"):
+        forward(shared_output_gate_weight=weight)
+    with pytest.raises(ValueError, match="prepared without the shared output gate"):
+        cutemok_backward(x, x, router_weights, None, None, None, *routed, None, None, **buffers, shared_output_gate_weight=weight)
 
     gate, up = torch.zeros(2, 256, 512, dtype=torch.bfloat16), torch.zeros(2, 256, 512, dtype=torch.bfloat16)
     down = torch.zeros(2, 512, 256, dtype=torch.bfloat16)

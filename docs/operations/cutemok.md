@@ -49,8 +49,9 @@ expert's plus the router-weighted sum of the routed experts' outputs.
 The forward returns a `TupleDict` with `output`, `schedule` and `forward_context`;
 the backward's keys are `d_x`, `d_router_weights`, `d_w_routed_gate`,
 `d_w_routed_up`, `d_w_routed_down`, `d_w_shared_gate`, `d_w_shared_up`,
-`d_w_shared_down` and `d_w_output_gate` (always `None`). Outputs and weight
-gradients are BF16, router-weight gradients FP32 (zero at unused slots).
+`d_w_shared_down` and `d_w_output_gate` (`None` without a shared output gate).
+Outputs and weight gradients are BF16, router-weight gradients FP32 (zero at
+unused slots).
 
 `cutemok_prepare`, collective over the group and outside graph capture, compiles
 every kernel the forward and backward launch and allocates the plan's workspace:
@@ -90,9 +91,15 @@ direction, minibatch sizes, a macrobatch up to the plan's) may change on every
 call and compile nothing. Variants are compile-time choices of prepare:
 `swiglu_clamped` (forward and backward then take `swiglu_limit=C`:
 `silu(min(gate, C)) * clip(up, -C, C)`), `situ` (SiTU-GLU, `situ_beta`),
-`has_shared`, `shared_output_gate` (forward only), `split_routed_weights`,
+`has_shared`, `shared_output_gate`, `split_routed_weights`,
 `main_grad_dtype`, `routed_precision`, `native_columnwise` and the config's
-`gate_up_context`, `comm_tile_shape` and `epilogue_combine`. One
+`gate_up_context`, `comm_tile_shape` and `epilogue_combine`. A plan prepared
+with `shared_output_gate=True` takes `shared_output_gate_weight` (BF16 `[1,H]`)
+in every forward and backward, and a plan without it declines one: the shared
+output is scaled by `sigmoid(x @ w^T)`, and the backward returns the weight's
+FP32 gradient as `d_w_output_gate`, or adds it into
+`shared_output_gate_main_grad` (FP32 or BF16 `[1,H]`). The gated backward runs
+fused Triton kernels. One
 `[E_local, 2I, H]` tensor passed as both routed gate and up is a combined FC1.
 The routed rows a rank receives, padded to 256 per local expert, must fit the
 schedule of `T * K * max(2, ceil(ranks * config.schedule_capacity_multiplier))`
@@ -112,8 +119,8 @@ Routed experts held in separate allocations are passed as
 `main_grads` (FP32 or BF16 buffers it accumulates into, instead of returning
 new weight gradients) and `main_grad_storage_tables`, the per-expert main-grad
 addresses as int64 CUDA tensors. Build the weights and tables once; again only
-when an allocation moves. The backward of a shared output gate and a backward
-from a forward context without its routed activations are not part of this API.
+when an allocation moves. A backward from a forward context without its routed
+activations is not part of this API.
 
 The public module is `python/cudnn/moe_ep/cutemok.py`; the implementation is the
 private package `python/cudnn/moe_ep/_cutemok/` (`functional.py`, `ops.py`,

@@ -1212,25 +1212,23 @@ def _forward(
     *,
     shared_output_gate_weight=None,
     situ_beta=None,
-    shared_output_gate=None,
     buffers=None,
 ):
     """The forward of ``forward`` and of ``forward_execute``: the same checks, staging copy, barriers and kernels.
 
     ``forward`` leaves ``buffers`` None: the megakernel's outputs and counters and the epilogue's output are
     allocated per call, and a kernel variant is compiled when it is first used.  ``forward_execute`` passes
-    ``buffers = (context_out, out, counters, scratch)`` -- the caller's megakernel outputs (nine BF16, or the
-    MXFP8 forward's thirteen / eleven) and final output, the plan's counter buffer and, for MXFP8, the plan's
-    four scratch buffers -- so nothing is allocated, and ``shared_output_gate``, the caller's G, where
-    ``forward`` computes it from ``shared_output_gate_weight``.
+    ``buffers = (context_out, out, counters, scratch, gate_out)`` -- the caller's megakernel outputs (nine BF16, or
+    the MXFP8 forward's thirteen / eleven) and final output, the plan's counter buffer, for MXFP8 the plan's four
+    scratch buffers and, gated, the caller's BF16 [num_local_tokens, 1] buffer of G -- so nothing is allocated.
     """
     _validate_config_type(config)
     validate_inputs(config, workspace, schedule, x, router_weights)
     from .cutedsl.persistent_bf16_fwd import shared_presence
 
-    context_out, out, counters, scratch = (None,) * 4 if buffers is None else buffers
+    context_out, out, counters, scratch, gate_out = (None,) * 5 if buffers is None else buffers
     has_shared = shared_presence(shared_gate_weights, shared_up_weights, shared_down_weights)
-    if (shared_output_gate_weight is not None or shared_output_gate is not None) and not has_shared:
+    if shared_output_gate_weight is not None and not has_shared:
         raise ValueError("shared output gate requires shared expert weights")
     if shared_output_gate_weight is not None:
         _validate_shared_output_gate_weight(shared_output_gate_weight, x)
@@ -1238,7 +1236,7 @@ def _forward(
 
     situ_beta = normalize_situ_beta(situ_beta, swiglu_limit)
     split_hidden = _routed_hidden_differs(workspace)
-    if split_hidden and (shared_output_gate_weight is not None or shared_output_gate is not None):
+    if split_hidden and shared_output_gate_weight is not None:
         raise NotImplementedError("the shared output gate needs routed_hidden_size == hidden_size")
     if split_hidden and not has_shared:
         raise NotImplementedError("a routed-only layer needs routed_hidden_size == hidden_size")
@@ -1378,11 +1376,14 @@ def _forward(
 
     if situ_beta is not None:
         forward_context = _replace_fields(forward_context, situ_beta=situ_beta)
+    shared_output_gate = None
     if shared_output_gate_weight is not None:
         # This functional API has a manual backward: no autograd graph (nor Z) is kept.
         with torch.no_grad():
-            shared_output_gate = torch.sigmoid(torch.nn.functional.linear(x, shared_output_gate_weight))
-    if shared_output_gate is not None:
+            if gate_out is None:
+                shared_output_gate = torch.sigmoid(torch.nn.functional.linear(x, shared_output_gate_weight))
+            else:  # forward_execute: the same GEMM (linear's x @ w^T) and sigmoid, into the caller's buffer
+                shared_output_gate = torch.sigmoid(torch.mm(x, shared_output_gate_weight.t(), out=gate_out), out=gate_out)
         forward_context = _replace_fields(forward_context, shared_output=y_shared, shared_output_gate=shared_output_gate)
     ops.barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs, workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
     if _routed_hidden_differs(workspace):
@@ -1694,13 +1695,15 @@ def _shared_output_gate_wgrad(
     d_z: torch.Tensor,
     x: torch.Tensor,
     main_grad: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The gate weight's FP32 gradient from BF16 d_z and x.
 
     With ``main_grad`` the contribution is added in place and that buffer returned; a BF16 buffer
-    rounds after the addition, not before it.
+    rounds after the addition, not before it.  ``out``: an FP32 [1, H] buffer the contribution is stored
+    into instead of a new tensor (backward_execute's).
     """
-    contribution = torch.mm(d_z.T, x, out_dtype=torch.float32)
+    contribution = torch.mm(d_z.T, x, out_dtype=torch.float32, out=out)
     if main_grad is None:
         return contribution
     main_grad.add_(contribution)
@@ -1867,15 +1870,15 @@ def _backward(
     ``backward`` leaves ``buffers`` None: the scratch, the weight gradients (without ``main_grads``), d_x and
     d_router_weights are allocated per call, the workspace keeps one counter / metadata set per configuration,
     and a kernel variant is compiled when it is first used.  ``backward_execute`` passes ``buffers = (scratch,
-    d_weights, storage, out, d_router_weights_out, route_mask)`` -- the plan's scratch, storage and route mask
-    and the caller's output buffers -- so nothing is allocated (BF16: seven scratch tensors and the (int32,
-    float32) storage; MXFP8: the flat scratch buffers by name and the int32 counter buffer).
+    d_weights, storage, out, d_router_weights_out, route_mask, gate_buffers)`` -- the plan's scratch, storage and
+    route mask and the caller's output buffers -- so nothing is allocated (BF16: seven scratch tensors and the
+    (int32, float32) storage; MXFP8: the flat scratch buffers by name and the int32 counter buffer).  Gated,
+    ``gate_buffers`` is (G * dY, dZ, the gate weight gradient's FP32 scratch) of the plan and the caller's
+    ``d_w_output_gate_out``; otherwise None.
     """
     _validate_config_type(config)
-    if buffers is not None and (
-        not isinstance(forward_context, CuteMoKForwardContext) or shared_output_gate_weight is not None or forward_context.shared_output_gate is not None
-    ):
-        raise NotImplementedError("backward_execute takes a forward context with routed activations and does " "not run the shared output gate")
+    if buffers is not None and not isinstance(forward_context, CuteMoKForwardContext):
+        raise NotImplementedError("backward_execute takes a forward context with routed activations")
     # The shared output gate: a gated forward context needs the weight back, and only a gated one
     # takes it.
     gate = forward_context.shared_output_gate if isinstance(forward_context, CuteMoKForwardContext) else None
@@ -1982,9 +1985,9 @@ def _backward(
 
     # Capability errors come before the call touches the workspace (the symmetric buffer copies
     # and the barrier below), like the validation errors above.
-    caller_buffers = None
+    caller_buffers = gate_buffers = None
     if buffers is not None:
-        scratch, d_weights, storage, out, d_router_weights_out, route_mask = buffers
+        scratch, d_weights, storage, out, d_router_weights_out, route_mask, gate_buffers = buffers
         if (
             type(d_router_weights_out) is not torch.Tensor
             or d_router_weights_out.dtype != torch.float32
@@ -2020,7 +2023,7 @@ def _backward(
             # on BF16.  The fused kernel makes one pass over grad_output and S; it differs from the
             # reference operations only in the FP32 summation order of dG.
             if fused_gate:
-                d_y_shared, d_z = _gate_fused._launch_gate_bwd_pre(grad_output, shared_output, gate)
+                d_y_shared, d_z = _gate_fused._launch_gate_bwd_pre(grad_output, shared_output, gate, out=None if gate_buffers is None else gate_buffers[:2])
             else:
                 d_y_shared, d_z = _gate_bwd_pre_reference(grad_output, shared_output, gate)
     # Peers read d_y_buffer and x_buffer only at routed rows.  With grad_output and x aligned, the
@@ -2185,12 +2188,16 @@ def _backward(
     d_w_output_gate = None
     if gate is not None:
         with torch.no_grad():
-            d_w_output_gate = _shared_output_gate_wgrad(d_z, x, shared_output_gate_main_grad)
+            d_w_output_gate = _shared_output_gate_wgrad(
+                d_z, x, shared_output_gate_main_grad, out=None if gate_buffers is None else gate_buffers[2 if shared_output_gate_main_grad is not None else 3]
+            )
             # Deliberate BF16 merge of dZ @ Wg after the original MLP epilogue, in place on its fresh d_x.
             if fused_gate and _fused_gate_kernels(d_x, shared_output_gate_weight):
                 d_x = _gate_fused._launch_gate_bwd_post_(d_x, d_z, shared_output_gate_weight)
-            else:
+            elif buffers is None:
                 d_x = d_x + d_z @ shared_output_gate_weight
+            else:  # backward_execute: the caller's d_x buffer
+                d_x.add_(d_z @ shared_output_gate_weight)
     if main_grads is None and up_row_offset:
         # Not accumulating, a combined FC1's gradient is this call's one [E, 2I, H] buffer, with
         # Up written I rows down; it is returned as the Gate and Up halves, the routed weights'
@@ -2236,6 +2243,10 @@ class CuteMoKPlan:
     backward_storage: tuple | torch.Tensor | None  # BF16 (int32, float32): its counters, decoder metadata,
     # router weights / partials; MXFP8: its int32 counters
     route_mask: torch.Tensor | None  # bool [max_tokens_per_rank, topk]: the unrouted slots of d_router_weights
+    shared_output_gate: bool  # calls pass shared_output_gate_weight (make_plan's shared_output_gate)
+    gate_scratch: tuple | None  # gated with the backward: BF16 G * dY [max_tokens_per_rank, H] and dZ
+    # [max_tokens_per_rank, 1], and the FP32 [1, H] gate weight gradient
+    # added into a shared_output_gate_main_grad
     _views: dict  # num_local_tokens -> that token count's view of the workspace
     _shapes: dict  # (step, ...) -> _schedule_shapes / _forward_shapes, computed once
 
@@ -2298,7 +2309,7 @@ class CuteMoKPlan:
         gate_routed_fp8, gate_routed_sc, up_shared, up_routed_fp8, up_routed_sc, hidden_shared, hidden_routed_t,
         hidden_routed_sc_t, y_shared, y_routed) and eleven with ``"bf16"`` (one BF16 gate_routed / up_routed
         each, no scales); e4m3, uint8 scale tiles or BF16.  None where a routed-only layer has no shared
-        output."""
+        output.  A plan with the shared output gate appends G's BF16 [num_local_tokens, 1] buffer."""
         key = ("forward", config, num_local_tokens)
         result = self._shapes.get(key)
         if result is not None:
@@ -2319,6 +2330,8 @@ class CuteMoKPlan:
                 gate_up_context=config.gate_up_context,
                 has_shared=self.has_shared,
             )
+            if self.shared_output_gate:
+                outputs += (((num_local_tokens, 1), torch.bfloat16),)
             result = outputs, (num_local_tokens, workspace.routed_hidden_size)
         else:
             shapes = persistent_bf16_output_shapes(
@@ -2338,6 +2351,8 @@ class CuteMoKPlan:
             )
             if not self.has_shared:
                 shapes = tuple(None if index in SHARED_OUTPUT_INDICES else shape for index, shape in enumerate(shapes))
+            if self.shared_output_gate:
+                shapes = (*shapes, (num_local_tokens, 1))
             result = shapes, (num_local_tokens, workspace.routed_hidden_size)
         self._shapes[key] = result
         return result
@@ -2408,7 +2423,8 @@ def make_plan(
     ``max_tokens_per_rank`` and the schedule capacity ``config.schedule_capacity_multiplier`` gives, peer address
     tables), the forward's counters (MXFP8: and its scratch, for ``config.macrobatch_size``), the scheduler's
     scratch and, with ``backward``, its scratch (token- and macrobatch-sized, for ``config.macrobatch_size``), its
-    counter / metadata / router-weight storage and the route mask.
+    counter / metadata / router-weight storage, the route mask and, gated, the shared output gate's scratch (whose
+    fused Triton kernels are compiled here too).
 
     Token counts, routed rows, macrobatch / minibatch sizes and the communication SMs are not part of the plan:
     they are runtime values of every execute call (a backward's macrobatch, and an MXFP8 forward's, at most the
@@ -2425,7 +2441,7 @@ def make_plan(
         situ:                 whether calls pass ``situ_beta``
         has_shared:           False for a routed-only layer
         split_routed_weights: whether the routed weights are ``CuteMoKSplitWeight``
-        shared_output_gate:   whether forward calls pass a shared output gate
+        shared_output_gate:   whether calls pass ``shared_output_gate_weight`` (every call on the plan does)
         backward:             False for a plan that only runs the schedule and the forward
         main_grad_dtype:      the dtype of the ``main_grads`` backward calls accumulate into (float32 or
                               bfloat16), or None when they store into ``d_weights_out``
@@ -2597,6 +2613,18 @@ def make_plan(
             minibatch_size=_bwd_minibatch_size(config),
         )
         backward_storage = (words(int_words), torch.zeros(float_words, dtype=torch.float32, device=device))
+    gate_scratch = None
+    if shared_output_gate and backward:
+        gate_scratch = (
+            torch.empty(max_tokens_per_rank, hidden_size, dtype=torch.bfloat16, device=device),
+            torch.empty(max_tokens_per_rank, 1, dtype=torch.bfloat16, device=device),
+            torch.empty(1, hidden_size, dtype=torch.float32, device=device),
+        )
+        # The gated backward's fused kernels, compiled over rows of the scratch (the row count is their grid).
+        d_shared, d_z, _ = gate_scratch
+        fused = _gate_fused_module()
+        fused._launch_gate_bwd_pre(d_shared[:1], d_shared[:1], d_z[:1], out=(d_shared[1:2], d_z[1:2]))
+        fused._launch_gate_bwd_post_(d_shared[1:2], d_z[:1], d_shared[:1])
     return CuteMoKPlan(
         workspace=workspace,
         num_local_experts=num_local_experts,
@@ -2610,6 +2638,8 @@ def make_plan(
         backward_scratch=backward_scratch,
         backward_storage=backward_storage,
         route_mask=route_mask,
+        shared_output_gate=shared_output_gate,
+        gate_scratch=gate_scratch,
         _views={},
         _shapes={},
     )
@@ -2625,6 +2655,26 @@ def _plan_workspace(plan, tensor, name: str, routed_weight=None) -> CuteMoKWorks
     if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2:
         raise ValueError(f"{name} must be a [num_local_tokens, ...] tensor")
     return plan.workspace_for(int(tensor.shape[0]))
+
+
+def _require_plan_gate(plan, shared_output_gate_weight) -> None:
+    """A gated call needs a plan prepared with the shared output gate, and such a plan takes gated calls only."""
+    if shared_output_gate_weight is None and plan.shared_output_gate:
+        raise ValueError("the plan was prepared with shared_output_gate=True: pass shared_output_gate_weight")
+    if shared_output_gate_weight is not None and not plan.shared_output_gate:
+        raise ValueError("shared_output_gate_weight on a plan prepared without the shared output gate (make_plan's shared_output_gate)")
+
+
+def _require_backward_gate(plan, forward_context, shared_output_gate_weight) -> None:
+    """``_require_plan_gate`` for a backward; a gated forward context without the weight raises ``_backward``'s
+    own error instead."""
+    if shared_output_gate_weight is not None or getattr(forward_context, "shared_output_gate", None) is None:
+        _require_plan_gate(plan, shared_output_gate_weight)
+
+
+def _check_buffer(name: str, tensor, dtype: torch.dtype, shape: tuple, device: torch.device) -> None:
+    if type(tensor) is not torch.Tensor or tensor.dtype != dtype or tensor.device != device or tuple(tensor.shape) != shape or not tensor.is_contiguous():
+        raise ValueError(f"{name} must be a contiguous {dtype} {list(shape)} tensor on the plan's device")
 
 
 def schedule_execute(
@@ -2665,7 +2715,7 @@ def forward_execute(
     *,
     context_out: tuple[torch.Tensor | None, ...],
     out: torch.Tensor,
-    shared_output_gate: torch.Tensor | None = None,
+    shared_output_gate_weight: torch.Tensor | None = None,
     situ_beta: tuple[float, float] | None = None,
 ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], CuteMoKForwardContext]:
     """The execute step of ``forward``: into the caller's buffers, compiling nothing (a kernel variant the plan
@@ -2679,7 +2729,7 @@ def forward_execute(
     Per call it launches, in order: the staging copy of the routed rows of ``x`` and of the router weights into
     the symmetric buffers (BF16: one kernel when ``x`` is 256-byte aligned and the hiddens coincide; otherwise,
     and with MXFP8 weights, two ``copy_``), ``barrier_all``, the zeroing of the plan's counters, the forward
-    megakernel, ``barrier_all`` and the forward epilogue.
+    megakernel, ``barrier_all``, gated the GEMM and sigmoid of G, and the forward epilogue.
 
     The inputs are ``forward``'s, with ``x`` of any token count up to the plan's maximum (the same on every
     rank) and ``schedule`` from ``schedule_execute`` (or ``build_schedule(plan.workspace_for(tokens), ...)``), and:
@@ -2687,11 +2737,11 @@ def forward_execute(
         context_out:        the megakernel outputs' buffers (``plan._forward_shapes``): nine BF16, or with
                             MXFP8 weights thirteen / eleven (``config.gate_up_context``) of their dtypes;
                             contiguous, 16-byte aligned; they become the returned context's tensors and must
-                            stay untouched until its backward (MXFP8: a macrobatch at most the plan config's)
+                            stay untouched until its backward (MXFP8: a macrobatch at most the plan config's);
+                            a gated plan's last one holds G = sigmoid(x @ w^T), BF16 [num_local_tokens, 1]
         out:                the output's buffer, BF16 [num_local_tokens, routed_hidden_size]: the layer
                             output, or y_routed when the routed hidden differs (y_shared is context_out[7])
-        shared_output_gate: the caller's G = sigmoid(x @ w^T), BF16 [num_local_tokens, 1], instead of
-                            ``forward``'s ``shared_output_gate_weight``; kept in the context
+        shared_output_gate_weight: ``forward``'s; given exactly when the plan has the shared output gate
 
     Outputs: as ``forward``, over the caller's buffers.
     """
@@ -2700,6 +2750,11 @@ def forward_execute(
     workspace = _plan_workspace(plan, x, "x", routed_gate_weights)
     if not isinstance(out, torch.Tensor) or context_out is None:
         raise ValueError("forward_execute needs the caller's context_out and out buffers")
+    _require_plan_gate(plan, shared_output_gate_weight)
+    gate_out = None
+    if plan.shared_output_gate:
+        *context_out, gate_out = context_out
+        _check_buffer("context_out's last buffer (G)", gate_out, torch.bfloat16, (workspace.num_local_tokens, 1), workspace.device)
     with compiled_only():
         return _forward(
             config,
@@ -2716,8 +2771,8 @@ def forward_execute(
             swiglu_limit,
             routed_input,
             situ_beta=situ_beta,
-            shared_output_gate=shared_output_gate,
-            buffers=(context_out, out, plan.forward_counters, plan.forward_scratch),
+            shared_output_gate_weight=shared_output_gate_weight,
+            buffers=(tuple(context_out), out, plan.forward_counters, plan.forward_scratch, gate_out),
         )
 
 
@@ -2745,6 +2800,9 @@ def backward_execute(
     d_router_weights_out: torch.Tensor,
     d_weights_out: tuple[torch.Tensor | None, ...] | None = None,
     zero_unrouted_router_grads: bool = True,
+    shared_output_gate_weight: torch.Tensor | None = None,
+    shared_output_gate_main_grad: torch.Tensor | None = None,
+    d_w_output_gate_out: torch.Tensor | None = None,
 ) -> tuple:
     """The execute step of ``backward``: into the caller's buffers, compiling nothing and allocating no device
     memory.
@@ -2759,10 +2817,13 @@ def backward_execute(
     builder (BF16) or the tensormap prologue (MXFP8), the backward megakernel (MXFP8 without ``main_grads``: and
     the zeroing of empty experts' weight gradients, in the same compiled call), ``barrier_all``, the backward
     epilogue, the copy of the router-weight gradients and, with ``zero_unrouted_router_grads``, a compare and a
-    masked fill of their unrouted slots.
+    masked fill of their unrouted slots.  Gated, the fused Triton kernel of G * dY and dZ comes before the staging
+    copy, and the gate weight's gradient GEMM (with a main_grad: and its addition) and the fused merge of
+    dZ @ w into d_x follow the epilogue; G * dY and dZ are the plan's scratch.  (Under a tensor subclass, dispatch
+    mode or torch.func transform the fused kernels' reference torch operations run instead, and allocate.)
 
     The inputs are ``backward``'s -- a forward context with its routed activations, a macrobatch at most the
-    plan config's, no shared output gate -- and:
+    plan config's; ``shared_output_gate_weight`` given exactly when the plan has the shared output gate -- and:
 
         out:                  the input gradient's buffer(s) (``plan._backward_shapes``): BF16
                               [num_local_tokens, hidden_size], or (d_x_shared, d_routed_input) when the
@@ -2773,8 +2834,11 @@ def backward_execute(
                               routed-only layer has no shared weight; a combined FC1 passes its one
                               [E, 2I, H] buffer as both the routed gate and up entries.  The kernel stores
                               into them.  With ``main_grads`` the gradients are accumulated there instead.
+        d_w_output_gate_out:  gated without ``shared_output_gate_main_grad``: FP32 [1, hidden_size], the gate
+                              weight's gradient; None otherwise
 
-    Outputs: as ``backward``, over the caller's buffers (the last entry, the gate weight's gradient, is None).
+    Outputs: as ``backward``, over the caller's buffers (the last entry, the gate weight's gradient, is
+    ``d_w_output_gate_out``, the ``shared_output_gate_main_grad`` it was added into, or None ungated).
     """
     from .cutedsl._host_common import compiled_only
 
@@ -2783,6 +2847,18 @@ def backward_execute(
         raise ValueError("the plan was made without the backward (make_plan(backward=False))")
     if (main_grads is None) == (d_weights_out is None):
         raise ValueError("backward_execute takes main_grads or d_weights_out, not both")
+    _require_backward_gate(plan, forward_context, shared_output_gate_weight)
+    gate_buffers = None
+    if shared_output_gate_weight is not None:
+        if (shared_output_gate_main_grad is None) == (d_w_output_gate_out is None):
+            raise ValueError("a gated backward_execute takes shared_output_gate_main_grad or d_w_output_gate_out, not both")
+        if d_w_output_gate_out is not None:
+            _check_buffer("d_w_output_gate_out", d_w_output_gate_out, torch.float32, (1, workspace.hidden_size), workspace.device)
+        tokens = workspace.num_local_tokens
+        d_shared, d_z, contribution = plan.gate_scratch
+        gate_buffers = (d_shared[:tokens], d_z[:tokens], contribution, d_w_output_gate_out)
+    elif d_w_output_gate_out is not None:
+        raise ValueError("d_w_output_gate_out is the gradient of shared_output_gate_weight, which is None")
     with compiled_only():
         return _backward(
             config,
@@ -2803,6 +2879,8 @@ def backward_execute(
             main_grad_storage_tables,
             routed_grad_output,
             routed_input,
+            shared_output_gate_weight=shared_output_gate_weight,
+            shared_output_gate_main_grad=shared_output_gate_main_grad,
             zero_unrouted_router_grads=zero_unrouted_router_grads,
-            buffers=(plan.backward_scratch, d_weights_out, plan.backward_storage, out, d_router_weights_out, plan.route_mask),
+            buffers=(plan.backward_scratch, d_weights_out, plan.backward_storage, out, d_router_weights_out, plan.route_mask, gate_buffers),
         )

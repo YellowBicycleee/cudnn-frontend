@@ -31,14 +31,16 @@ from cudnn.moe_ep._cutemok.functional import (
     CuteMoKSplitWeight,
     _combined_fc1,
     _empty_buffers,
+    _require_backward_gate,
+    _require_plan_gate,
     backward_execute,
     forward_execute,
     make_plan,
     schedule_execute,
 )
 
-#: The keys of the backward's result, in order.  The ninth is the shared output gate weight's gradient, which this
-#: API does not compute (None).
+#: The keys of the backward's result, in order.  The ninth is the shared output gate weight's gradient (None without
+#: the gate).
 _BACKWARD_RESULT_NAMES = (
     "d_x",
     "d_router_weights",
@@ -175,7 +177,7 @@ def cutemok_forward(
     config: CuteMoKConfig,
     swiglu_limit: float | None = None,
     routed_input: torch.Tensor | None = None,
-    shared_output_gate: torch.Tensor | None = None,
+    shared_output_gate_weight: torch.Tensor | None = None,
     situ_beta: tuple[float, float] | None = None,
 ) -> TupleDict:
     """Dispatch the tokens to their top-k experts, run the expert MLPs and combine the results.  Collective over
@@ -183,9 +185,9 @@ def cutemok_forward(
 
     Allocates its results (the output, the schedule and the saved activations, ``torch.empty``) and launches
     ``schedule_execute``'s kernels (route all-gather, barrier, three scheduler kernels) and then
-    ``forward_execute``'s (staging copy, barrier, counter reset, forward megakernel, barrier, epilogue).  Every
-    element of the results is written by the kernels (unused schedule capacity is never read), so nothing is
-    zeroed.
+    ``forward_execute``'s (staging copy, barrier, counter reset, forward megakernel, barrier, gated the GEMM and
+    sigmoid of G, epilogue).  Every element of the results is written by the kernels (unused schedule capacity is
+    never read), so nothing is zeroed.
 
     Inputs:
         x:                 bfloat16 [T, hidden_size], T a multiple of 256 in [512, max_tokens_per_rank]
@@ -197,8 +199,9 @@ def cutemok_forward(
                            (``CuteMoKSplitWeight.from_experts``).  One object as both gate and up: a combined FC1.
         plan:              from cutemok_prepare
         config:            CuteMoKConfig of this call
-        swiglu_limit, routed_input, shared_output_gate (G = sigmoid(x @ w^T), bfloat16 [T, 1]), situ_beta:
-                           the options of ``cudnn.moe_ep._cutemok.functional.forward_execute``
+        shared_output_gate_weight: bfloat16 [1, hidden_size], given exactly when the plan was prepared with
+                           ``shared_output_gate=True``: the shared output is scaled by G = sigmoid(x @ w^T)
+        swiglu_limit, routed_input, situ_beta: the options of ``cudnn.moe_ep._cutemok.functional.forward_execute``
 
     Returns:
         TupleDict(output, schedule, forward_context): ``output`` is bfloat16 [T, routed_hidden_size] (with differing hiddens
@@ -213,6 +216,7 @@ def cutemok_forward(
     ):
         _decline_layout(name, tensor, dtype)
     _decline_routed_weights(plan, (routed_gate_weights, routed_up_weights, routed_down_weights))
+    _require_plan_gate(plan, shared_output_gate_weight)
     device = plan.workspace.device
     schedule_out = _empty_buffers(plan._schedule_shapes(int(top_experts.shape[0])), torch.int32, device)
     schedule = schedule_execute(plan, config, top_experts, out=schedule_out)
@@ -233,7 +237,7 @@ def cutemok_forward(
         routed_input,
         context_out=_empty_buffers(context_shapes, torch.bfloat16, device),
         out=_empty_buffers(out_shape, torch.bfloat16, device),
-        shared_output_gate=shared_output_gate,
+        shared_output_gate_weight=shared_output_gate_weight,
         situ_beta=situ_beta,
     )
     return TupleDict(output=output, schedule=schedule, forward_context=forward_context)
@@ -260,12 +264,15 @@ def cutemok_backward(
     routed_grad_output: torch.Tensor | None = None,
     routed_input: torch.Tensor | None = None,
     zero_unrouted_router_grads: bool = True,
+    shared_output_gate_weight: torch.Tensor | None = None,
+    shared_output_gate_main_grad: torch.Tensor | None = None,
 ) -> TupleDict:
-    """The gradients of ``cutemok_forward`` with respect to x, the router weights and the six
-    weights.  Collective over the plan's group.  Allocates its results (``torch.empty``; every element is written
-    by the kernels, so nothing is zeroed) and launches ``backward_execute``'s kernels (staging copy, barrier,
-    counter reset, metadata builder or tensormap prologue, backward megakernel, barrier, epilogue, router-weight
-    gradient copy and, with ``zero_unrouted_router_grads``, the masking of unrouted slots).
+    """The gradients of ``cutemok_forward`` with respect to x, the router weights, the six weights and the shared
+    output gate's weight.  Collective over the plan's group.  Allocates its results (``torch.empty``; every element
+    is written by the kernels, so nothing is zeroed) and launches ``backward_execute``'s kernels (gated: the fused
+    G * dY / dZ kernel; staging copy, barrier, counter reset, metadata builder or tensormap prologue, backward
+    megakernel, barrier, epilogue, router-weight gradient copy and, with ``zero_unrouted_router_grads``, the
+    masking of unrouted slots; gated: the gate weight's gradient GEMM and the fused merge into d_x).
 
     Inputs: the forward's, with the weights' backward forms (MXFP8: (e4m3, scale, e4m3_t, scale_t) for gate / up,
     (e4m3_t, scale_t) for down, the backward forms of ``cutemok_quantize_weights``), and:
@@ -281,14 +288,18 @@ def cutemok_backward(
                               gate and up); ``main_grads`` holds the first expert's buffers
         swiglu_limit, routed_grad_output, routed_input, zero_unrouted_router_grads:
                               the options of ``cudnn.moe_ep._cutemok.functional.backward_execute``
+        shared_output_gate_weight: the forward's, unchanged (a gated forward context requires it)
+        shared_output_gate_main_grad: optional BF16 or FP32 [1, hidden_size] buffer the gate weight's gradient
+                              is added into
 
     Returns:
         TupleDict of ``backward_execute``'s nine entries, in its order: d_x (bfloat16 [T, hidden_size]; with
         differing hiddens the pair (d_x_shared, d_routed_input)), d_router_weights (float32 [T, topk]),
         d_w_routed_gate, d_w_routed_up, d_w_routed_down, d_w_shared_gate, d_w_shared_up and d_w_shared_down
         (bfloat16, shaped like the weights; a combined FC1's gate and up are the halves of one allocation; with
-        ``main_grads`` the entries alias the buffers they were added into), and d_w_output_gate (None: not
-        computed here).
+        ``main_grads`` the entries alias the buffers they were added into), and d_w_output_gate: the gate weight's
+        float32 [1, hidden_size] gradient (the ``shared_output_gate_main_grad`` it was added into, if given; None
+        without the gate).
     """
     for name, tensor, dtype in (
         ("grad_output", grad_output, torch.bfloat16),
@@ -299,6 +310,7 @@ def cutemok_backward(
     ):
         _decline_layout(name, tensor, dtype)
     _decline_routed_weights(plan, (routed_gate_weights, routed_up_weights, routed_down_weights))
+    _require_backward_gate(plan, forward_context, shared_output_gate_weight)
     device = plan.workspace.device
     out_shape, d_router_shape, d_weight_shapes = plan._backward_shapes(int(x.shape[0]))
     d_weights_out = None
@@ -312,6 +324,9 @@ def cutemok_backward(
         if combined:
             d_weights_out[3] = d_weights_out[1]
         d_weights_out = tuple(d_weights_out)
+    d_w_output_gate_out = None
+    if shared_output_gate_weight is not None and shared_output_gate_main_grad is None:
+        d_w_output_gate_out = torch.empty(1, plan.workspace.hidden_size, dtype=torch.float32, device=device)
     gradients = backward_execute(
         plan,
         config,
@@ -335,6 +350,9 @@ def cutemok_backward(
         d_router_weights_out=_empty_buffers(d_router_shape, torch.float32, device),
         d_weights_out=d_weights_out,
         zero_unrouted_router_grads=zero_unrouted_router_grads,
+        shared_output_gate_weight=shared_output_gate_weight,
+        shared_output_gate_main_grad=shared_output_gate_main_grad,
+        d_w_output_gate_out=d_w_output_gate_out,
     )
     return TupleDict(zip(_BACKWARD_RESULT_NAMES, gradients, strict=True))
 

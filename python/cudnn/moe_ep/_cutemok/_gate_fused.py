@@ -107,14 +107,19 @@ def _launch_gate_bwd_pre(
     dy: torch.Tensor,
     shared_output: torch.Tensor,
     gate: torch.Tensor,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """gate_bwd_pre without its argument checks, for operands that are valid by construction (CuteMoK's backward)."""
+    """gate_bwd_pre without its argument checks, for operands that are valid by construction (CuteMoK's backward).
+    ``out``: contiguous (d_shared, d_z) buffers to store into instead of new tensors (backward_execute's)."""
     dy = dy.contiguous()
     shared_output = shared_output.contiguous()
     gate = gate.contiguous()
     num_local_tokens, hidden_size = dy.shape
-    d_shared = torch.empty_like(dy)
-    d_z = torch.empty((num_local_tokens, 1), dtype=torch.bfloat16, device=dy.device)
+    if out is None:
+        d_shared = torch.empty_like(dy)
+        d_z = torch.empty((num_local_tokens, 1), dtype=torch.bfloat16, device=dy.device)
+    else:
+        d_shared, d_z = out
     if num_local_tokens:
         block_h = triton.next_power_of_2(hidden_size)
         _gate_bwd_pre_kernel[(num_local_tokens,)](dy, shared_output, gate, d_shared, d_z, hidden_size, BLOCK_H=block_h, num_warps=_warps(block_h))
